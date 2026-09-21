@@ -1,6 +1,8 @@
 # MatPacker
 
-Simple tool to convert image formats into KTX2 and pack multiple textures together.
+A tool designed to convert images into KTX2 textures and pack them into game ready textures. You can also pull materials from GLTF models!
+
+<img src="Screenshots/matpacker2.png" width="400" height="400" />
 
 ## Features
 
@@ -17,3 +19,7 @@ Simple tool to convert image formats into KTX2 and pack multiple textures togeth
 | Image 1 (diffuse) | Albedo R          | Albedo G  | Albedo B | Albedo A         |
 | Image 2 (normal)  | Normal R          | Normal G  | Normal B | Unused (for now) |
 | Image 3 (ORM)     | Ambient Occlusion | Roughness | Metallic | Unused (for now) |
+
+## AI Disclaimer
+
+LLMs were used in the original prototype of this application, and are used to find and fix bugs.
