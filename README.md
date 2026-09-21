@@ -2,7 +2,7 @@
 
 A tool designed to convert images into KTX2 textures and pack them into game ready textures. You can also pull materials from GLTF models!
 
-<img src="Screenshots/matpacker2.png" width="400" height="400" />
+<img src="Screenshots/matpacker2.png" width="400" height="600" />
 
 ## Features
 

@@ -12,7 +12,7 @@ namespace {
 
 struct LoadedImage
 {
-	Image8 RGBAImage;
+	MPImage RGBAImage;
 	bool bIsOK = false;
 };
 
@@ -73,23 +73,23 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 	int diffuse_w = 0, diffuse_h = 0;
 	std::string err;
 
-	auto OutputImage = [&](const std::string& path, const Image8& img, ColorSpace cs, bool normal)
+	auto OutputImage = [&](const std::string& path, const MPImage& img, eColorSpace cs, bool normal)
 	{
-		Image8 scaled;
+		MPImage scaled;
 		if (bake_settings.ResolutionDivisor > 1) {
-			scaled = ResizeImage(img, std::max(1, img.width / bake_settings.ResolutionDivisor),
-								 std::max(1, img.height / bake_settings.ResolutionDivisor), cs, normal);
+			scaled = ResizeImage(img, std::max(1, img.Width / bake_settings.ResolutionDivisor),
+								 std::max(1, img.Height / bake_settings.ResolutionDivisor), cs, normal);
 		}
 
-		const Image8& out_img = bake_settings.ResolutionDivisor > 1 ? scaled : img;
+		const MPImage& out_img = bake_settings.ResolutionDivisor > 1 ? scaled : img;
 
-		std::string e = WriteKtx2(path, out_img, cs, bake_settings.bExportMipmaps, normal);
+		std::string e = WriteKTX2(path, out_img, cs, bake_settings.bExportMipmaps, normal, bake_settings.Compression);
 		if (e.empty()) {
 			if (written) {
 				written->push_back(path);
 			}
 
-			log("Wrote " + path + " (" + std::to_string(out_img.width) + "x" + std::to_string(out_img.height) + ")");
+			log("Wrote " + path + " (" + std::to_string(out_img.Width) + "x" + std::to_string(out_img.Height) + ")");
 		}
 		else {
 			log("Error: " + e);
@@ -106,9 +106,9 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 			all_ok = false;
 		}
 		else {
-			diffuse_w = l.RGBAImage.width;
-			diffuse_h = l.RGBAImage.height;
-			OutputImage(MakeOutputPath("_diffuse"), l.RGBAImage, ColorSpace::SRGB, false);
+			diffuse_w = l.RGBAImage.Width;
+			diffuse_h = l.RGBAImage.Height;
+			OutputImage(MakeOutputPath("_diffuse"), l.RGBAImage, eColorSpace::SRGB, false);
 		}
 	}
 	else {
@@ -123,11 +123,11 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 			all_ok = false;
 		}
 		else {
-			for (size_t i = 3; i < l.RGBAImage.pixels.size(); i += 4) {
-				l.RGBAImage.pixels[i] = 255;
+			for (size_t i = 3; i < l.RGBAImage.Pixels.size(); i += 4) {
+				l.RGBAImage.Pixels[i] = 255;
 			}
 
-			OutputImage(MakeOutputPath("_normal"), l.RGBAImage, ColorSpace::Linear, true);
+			OutputImage(MakeOutputPath("_normal"), l.RGBAImage, eColorSpace::Linear, true);
 		}
 	}
 	else {
@@ -170,10 +170,10 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 		height = diffuse_h ? diffuse_h : 1;
 	}
 
-	Image8 orm;
-	orm.width = width;
-	orm.height = height;
-	orm.pixels.resize(size_t(width) * height * 4);
+	MPImage orm;
+	orm.Width = width;
+	orm.Height = height;
+	orm.Pixels.resize(size_t(width) * height * 4);
 
 	for (int component_index = 0; component_index < 3; component_index++) {
 		std::vector<uint8_t> plane;
@@ -200,14 +200,14 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 		}
 
 		for (size_t i = 0; i < plane.size(); i++) {
-			orm.pixels[i * 4 + component_index] = plane[i];
+			orm.Pixels[i * 4 + component_index] = plane[i];
 		}
 	}
 
-	for (size_t i = 3; i < orm.pixels.size(); i += 4) {
-		orm.pixels[i] = 255;
+	for (size_t i = 3; i < orm.Pixels.size(); i += 4) {
+		orm.Pixels[i] = 255;
 	}
 
-	OutputImage(MakeOutputPath("_orm"), orm, ColorSpace::Linear, false);
+	OutputImage(MakeOutputPath("_orm"), orm, eColorSpace::Linear, false);
 	return all_ok;
 }

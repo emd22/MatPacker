@@ -28,6 +28,8 @@ struct BakeSettings
 
 	// Output resolution is the source resolution divided by this (1 = full, 2 = half, ...).
 	int ResolutionDivisor = 1;
+
+	eTextureCompression Compression = eTextureCompression::None;
 };
 
 // Bakes the configured textures to <outputDir>/<baseName>_{diffuse,normal,orm}.ktx2.

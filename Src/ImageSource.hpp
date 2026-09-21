@@ -59,7 +59,7 @@ bool IsGltfPath(const std::string& path);
 bool ListGltfMaterials(const std::string& path, std::vector<GltfMaterial>& materials, std::string& error);
 
 // Loads the whole image as RGBA8.
-bool LoadImageRGBA(const ImageSource& source, Image8& image, std::string& error);
+bool LoadImageRGBA(const ImageSource& source, MPImage& image, std::string& error);
 
 // Loads a single 8-bit component: the source's channel, or its luminance when Channel is -1.
 bool LoadImageComponent(const ImageSource& source, int& width, int& height, std::vector<uint8_t>& pixels,

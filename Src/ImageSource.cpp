@@ -195,8 +195,8 @@ bool Decode(const ImageSource& source, int desired_components, int& width, int& 
 		data = stbi_load(encoded.FilePath.c_str(), &width, &height, &num_components, desired_components);
 	}
 	else {
-		data = stbi_load_from_memory(encoded.Bytes.data(), int(encoded.Bytes.size()), &width, &height,
-									 &num_components, desired_components);
+		data = stbi_load_from_memory(encoded.Bytes.data(), int(encoded.Bytes.size()), &width, &height, &num_components,
+									 desired_components);
 	}
 
 	if (!data) {
@@ -311,9 +311,9 @@ bool ListGltfMaterials(const std::string& path, std::vector<GltfMaterial>& mater
 	return true;
 }
 
-bool LoadImageRGBA(const ImageSource& source, Image8& image, std::string& error)
+bool LoadImageRGBA(const ImageSource& source, MPImage& image, std::string& error)
 {
-	return Decode(source, 4, image.width, image.height, image.pixels, error);
+	return Decode(source, 4, image.Width, image.Height, image.Pixels, error);
 }
 
 bool LoadImageComponent(const ImageSource& source, int& width, int& height, std::vector<uint8_t>& pixels,

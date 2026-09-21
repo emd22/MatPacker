@@ -50,6 +50,17 @@ public:
 			mbCreateSubfolder = ini[spcSectionOutput][spcKeyCreateSubfolder] == "1";
 		}
 
+		if (ini.has(spcSectionOutput) && ini[spcSectionOutput].has(spcKeyCompression)) {
+			try {
+				const int value = std::stoi(ini[spcSectionOutput][spcKeyCompression]);
+				mCompression = value >= 0 && value <= int(eTextureCompression::Astc4x4) ? eTextureCompression(value)
+																						: eTextureCompression::None;
+			}
+			catch (const std::exception&) {
+				// Malformed value: keep the default.
+			}
+		}
+
 		if (ini.has(spcSectionOutput) && ini[spcSectionOutput].has(spcKeyResolutionDivisor)) {
 			try {
 				mResolutionDivisor = std::max(1, std::stoi(ini[spcSectionOutput][spcKeyResolutionDivisor]));
@@ -70,6 +81,7 @@ public:
 		file.read(ini);
 		ini[spcSectionOutput][spcKeyDefaultOutputDir] = mDefaultOutputDir;
 		ini[spcSectionOutput][spcKeyResolutionDivisor] = std::to_string(mResolutionDivisor);
+		ini[spcSectionOutput][spcKeyCompression] = std::to_string(int(mCompression));
 		ini[spcSectionOutput][spcKeyCreateSubfolder] = mbCreateSubfolder ? "1" : "0";
 
 		return file.write(ini, true);
@@ -77,6 +89,9 @@ public:
 
 	const std::string& GetDefaultOutputDir() const { return mDefaultOutputDir; }
 	void SetDefaultOutputDir(const std::string& dir) { mDefaultOutputDir = dir; }
+
+	eTextureCompression GetCompression() const { return mCompression; }
+	void SetCompression(eTextureCompression compression) { mCompression = compression; }
 
 	int GetResolutionDivisor() const { return mResolutionDivisor; }
 	void SetResolutionDivisor(int divisor) { mResolutionDivisor = std::max(1, divisor); }
@@ -94,10 +109,12 @@ private:
 	static constexpr const char* spcSectionOutput = "Output";
 	static constexpr const char* spcKeyDefaultOutputDir = "DefaultDirectory";
 	static constexpr const char* spcKeyResolutionDivisor = "ResolutionDivisor";
+	static constexpr const char* spcKeyCompression = "Compression";
 	static constexpr const char* spcKeyCreateSubfolder = "CreateSubfolder";
 
 	std::string mDefaultOutputDir;
 	int mResolutionDivisor = 1;
+	eTextureCompression mCompression = eTextureCompression::None;
 	bool mbCreateSubfolder = false;
 };
 
@@ -395,23 +412,23 @@ public:
 			 });
 	}
 
-	void SetImage(const Image8* img)
+	void SetImage(const MPImage* img)
 	{
 		mImage = wxImage();
 
-		if (img && !img->Empty()) {
-			const size_t n = static_cast<size_t>(img->width) * img->height;
+		if (img && !img->IsEmpty()) {
+			const size_t n = static_cast<size_t>(img->Width) * img->Height;
 			auto* rgb = static_cast<unsigned char*>(malloc(n * 3));
 			auto* alpha = static_cast<unsigned char*>(malloc(n));
 
 			for (size_t i = 0; i < n; ++i) {
-				rgb[i * 3] = img->pixels[i * 4];
-				rgb[i * 3 + 1] = img->pixels[i * 4 + 1];
-				rgb[i * 3 + 2] = img->pixels[i * 4 + 2];
-				alpha[i] = img->pixels[i * 4 + 3];
+				rgb[i * 3] = img->Pixels[i * 4];
+				rgb[i * 3 + 1] = img->Pixels[i * 4 + 1];
+				rgb[i * 3 + 2] = img->Pixels[i * 4 + 2];
+				alpha[i] = img->Pixels[i * 4 + 3];
 			}
 
-			mImage = wxImage(img->width, img->height, rgb, alpha, false);
+			mImage = wxImage(img->Width, img->Height, rgb, alpha, false);
 		}
 
 		mbDirty = true;
@@ -608,6 +625,26 @@ public:
 						});
 
 		ogrid->Add(mpDivisor, 0);
+
+		ogrid->Add(new wxStaticText(out->GetStaticBox(), wxID_ANY, "Compression"), 0, wxALIGN_CENTER_VERTICAL);
+
+		mpCompression = new wxChoice(out->GetStaticBox(), wxID_ANY);
+		for (const char* label : spcCompressionLabels) {
+			mpCompression->Append(label);
+		}
+
+		mpCompression->SetSelection(int(mConfig.GetCompression()));
+		mpCompression->Bind(wxEVT_CHOICE,
+							[this](wxCommandEvent&)
+							{
+								mConfig.SetCompression(eTextureCompression(std::max(0, mpCompression->GetSelection())));
+
+								if (!mConfig.Save()) {
+									mpLog->AppendText("Error: could not save the compression setting.\n");
+								}
+							});
+
+		ogrid->Add(mpCompression, 0);
 		out->Add(ogrid, 0, wxEXPAND | wxALL, 6);
 
 		mpMips = new wxCheckBox(out->GetStaticBox(), wxID_ANY, "Generate Mipmaps");
@@ -673,6 +710,11 @@ public:
 
 private:
 	// Output resolution divisors offered in the UI; labels and values must stay in the same order.
+	// In the same order as eTextureCompression.
+	static constexpr const char* spcCompressionLabels[] = { "None (raw RGBA8)", "Zstd (lossless, smaller file)",
+															"Basis UASTC + Zstd (BC7 / ASTC on load)",
+															"ASTC 4x4 (mobile / Apple GPUs)" };
+
 	static constexpr int spcDivisors[] = { 1, 2, 4, 8 };
 	static constexpr const char* spcDivisorLabels[] = { "Full size", "1/2 (half)", "1/4 (quarter)", "1/8 (eighth)" };
 
@@ -1093,6 +1135,7 @@ private:
 		bake_settings.bExportMipmaps = mpMips->GetValue();
 		bake_settings.bCreateSubfolder = mpSubfolder->GetValue();
 		bake_settings.ResolutionDivisor = spcDivisors[std::max(0, mpDivisor->GetSelection())];
+		bake_settings.Compression = eTextureCompression(std::max(0, mpCompression->GetSelection()));
 
 		mpLog->Clear();
 		wxBusyCursor busy;
@@ -1141,8 +1184,8 @@ private:
 		mpTexChoice->Clear();
 
 		for (const std::string& path : files) {
-			std::vector<Image8> levels;
-			std::string e = ReadKtx2Levels(path, levels);
+			std::vector<MPImage> levels;
+			std::string e = ReadKTX2Levels(path, levels);
 
 			if (!e.empty()) {
 				mpLog->AppendText("Viewer: " + wxString::FromUTF8(e) + "\n");
@@ -1175,7 +1218,7 @@ private:
 		const auto& levels = mTextures[index];
 
 		for (size_t i = 0; i < levels.size(); i++) {
-			mpLevelList->Append(wxString::Format("Level %zu  -  %d x %d", i, levels[i].width, levels[i].height));
+			mpLevelList->Append(wxString::Format("Level %zu  -  %d x %d", i, levels[i].Width, levels[i].Height));
 		}
 
 		mpLevelList->SetSelection(0);
@@ -1190,9 +1233,9 @@ private:
 			return;
 		}
 
-		const Image8& img = mTextures[tex][level];
+		const MPImage& img = mTextures[tex][level];
 		mpCanvas->SetImage(&img);
-		mpLevelInfo->SetLabel(wxString::Format("%d x %d  (%zu bytes)", img.width, img.height, img.pixels.size()));
+		mpLevelInfo->SetLabel(wxString::Format("%d x %d  (%zu bytes)", img.Width, img.Height, img.Pixels.size()));
 	}
 
 private:
@@ -1206,13 +1249,14 @@ private:
 	wxCheckBox* mpMips;
 	wxCheckBox* mpSubfolder;
 	wxChoice* mpDivisor;
+	wxChoice* mpCompression;
 	wxNotebook* mpTabs;
 	wxChoice* mpTexChoice;
 	wxListBox* mpLevelList;
 	wxStaticText* mpLevelInfo;
 	ImageCanvas* mpCanvas;
 
-	std::vector<std::vector<Image8>> mTextures;
+	std::vector<std::vector<MPImage>> mTextures;
 	ConfigSettings mConfig;
 };
 
