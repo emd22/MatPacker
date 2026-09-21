@@ -13,6 +13,8 @@ add_executable(MatBuilder
     Src/MatPacker.cpp
     Src/Ktx2.cpp
     Src/Baker.cpp
+    Src/ImageSource.cpp
+    Src/ThirdParty/cgltf.cpp
     Src/ThirdParty/stb_image.cpp
     Src/ThirdParty/stb_image_resize2.cpp
     Src/ThirdParty/stb_image_write.cpp

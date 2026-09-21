@@ -6,7 +6,6 @@
 #include <cmath>
 #include <filesystem>
 
-#include "stb_image.h"
 #include "stb_image_resize2.h"
 
 namespace {
@@ -17,27 +16,10 @@ struct LoadedImage
 	bool bIsOK = false;
 };
 
-LoadedImage LoadRGBAImage(const std::string& path, std::string& error)
+LoadedImage LoadRGBAImage(const ImageSource& source, std::string& error)
 {
 	LoadedImage loaded_image;
-
-	int width, height, num_components;
-
-	stbi_uc* data = stbi_load(path.c_str(), &width, &height, &num_components, 4);
-
-	if (!data) {
-		error = "failed to load '" + path + "': " + stbi_failure_reason();
-		return loaded_image;
-	}
-
-	loaded_image.RGBAImage.width = width;
-	loaded_image.RGBAImage.height = height;
-
-	loaded_image.RGBAImage.pixels.assign(data, data + size_t(width) * height * 4);
-
-	stbi_image_free(data);
-	loaded_image.bIsOK = true;
-
+	loaded_image.bIsOK = LoadImageRGBA(source, loaded_image.RGBAImage, error);
 	return loaded_image;
 }
 
@@ -50,19 +32,9 @@ struct GrayscaleImage
 	std::vector<uint8_t> Pixels;
 };
 
-bool LoadGray(const std::string& path, GrayscaleImage& g, std::string& error)
+bool LoadGray(const ImageSource& source, GrayscaleImage& g, std::string& error)
 {
-	int w, h, n;
-	stbi_uc* data = stbi_load(path.c_str(), &w, &h, &n, 1);
-	if (!data) {
-		error = "failed to load '" + path + "': " + stbi_failure_reason();
-		return false;
-	}
-	g.Width = w;
-	g.Height = h;
-	g.Pixels.assign(data, data + size_t(w) * h);
-	stbi_image_free(data);
-	return true;
+	return LoadImageComponent(source, g.Width, g.Height, g.Pixels, error);
 }
 
 uint8_t ToByte(float v) { return uint8_t(std::clamp(std::lround(v * 255.0f), 0L, 255L)); }
@@ -126,7 +98,7 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 	};
 
 	// Image 1, diffuse / base color (sRGB)
-	if (!bake_settings.PathDiffuse.empty()) {
+	if (!bake_settings.PathDiffuse.Empty()) {
 		LoadedImage l = LoadRGBAImage(bake_settings.PathDiffuse, err);
 
 		if (!l.bIsOK) {
@@ -144,7 +116,7 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 	}
 
 	// Image 2, normal map (linear)
-	if (!bake_settings.PathNormalMap.empty()) {
+	if (!bake_settings.PathNormalMap.Empty()) {
 		LoadedImage l = LoadRGBAImage(bake_settings.PathNormalMap, err);
 		if (!l.bIsOK) {
 			log("Error: " + err);
@@ -164,7 +136,7 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 
 	// Image 3,  R = AO, G = Roughness, B = Metallic, A unused.
 	// Channel order (R, G, B) is the ORM convention: Occlusion, Roughness, Metallic.
-	const std::string* paths[3] = { &bake_settings.PathAO, &bake_settings.PathRoughness, &bake_settings.PathMetallic };
+	const ImageSource* paths[3] = { &bake_settings.PathAO, &bake_settings.PathRoughness, &bake_settings.PathMetallic };
 	const float defaults[3] = { bake_settings.DefaultAO, bake_settings.DefaultRoughness,
 								bake_settings.DefaultMetallic };
 	const char* names[3] = { "AO", "roughness", "metallic" };
@@ -175,7 +147,7 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 	int width = 0, height = 0;
 
 	for (int component_index = 0; component_index < 3; component_index++) {
-		if (paths[component_index]->empty()) {
+		if (paths[component_index]->Empty()) {
 			continue;
 		}
 

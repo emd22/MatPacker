@@ -1,4 +1,5 @@
 #include "Baker.hpp"
+#include "ImageSource.hpp"
 #include "Ktx2.hpp"
 
 #include <wx/dataview.h>
@@ -13,11 +14,12 @@
 
 #include <algorithm>
 #include <iterator>
+#include <memory>
 #include <optional>
+#include <set>
 #include <string>
 
 #include "ThirdParty/mINI.h"
-#include "stb_image.h"
 
 static const char* spcConfigSettingsPath = "config.ini";
 
@@ -99,6 +101,281 @@ private:
 	bool mbCreateSubfolder = false;
 };
 
+enum class eImageRole
+{
+	Unused,
+	Diffuse,
+	Normal,
+	Roughness,
+	Metallic,
+	AmbientOcclusion
+};
+
+static constexpr const char* spcRoles[] = { "Unused",			"Diffuse / Base colour",
+											"Normal map",		"Roughness (ORM.G)",
+											"Metallic (ORM.B)", "AO (ORM.R)" };
+
+/**
+ * @brief The nested list of inputs: glTF model -> material -> texture. Images added directly (not from a model)
+ * sit under one "Loose images" material. Every material is something that can be exported, and each role is held by
+ * at most one texture per material.
+ */
+class ImageTreeModel : public wxDataViewModel
+{
+public:
+	enum class eKind
+	{
+		Root,
+		Model,
+		Material,
+		Image
+	};
+
+	struct Node
+	{
+		eKind Kind = eKind::Image;
+		Node* Parent = nullptr;
+		std::vector<std::unique_ptr<Node>> Children;
+
+		wxString Name;
+		wxString SizeText;
+		wxString Source; // file or folder the entry came from
+		eImageRole Role = eImageRole::Unused;
+		ImageSource Image; // Image nodes only
+	};
+
+	static constexpr unsigned spcColumnRole = 1;
+
+	ImageTreeModel()
+	{
+		mRoot = std::make_unique<Node>();
+		mRoot->Kind = eKind::Root;
+	}
+
+	Node* Root() const { return mRoot.get(); }
+
+	static Node* ToNode(const wxDataViewItem& item) { return static_cast<Node*>(item.GetID()); }
+
+	wxDataViewItem ToItem(const Node* node) const
+	{
+		return node == mRoot.get() ? wxDataViewItem(nullptr) : wxDataViewItem(const_cast<Node*>(node));
+	}
+
+	/// Adds a child under `parent` and tells the view about it.
+	Node* Add(Node* parent, eKind kind, const wxString& name, const wxString& source = {},
+			  const wxString& size_text = {})
+	{
+		auto node = std::make_unique<Node>();
+		node->Kind = kind;
+		node->Parent = parent;
+		node->Name = name;
+		node->Source = source;
+		node->SizeText = size_text;
+
+		Node* raw = node.get();
+		parent->Children.push_back(std::move(node));
+		ItemAdded(ToItem(parent), ToItem(raw));
+
+		return raw;
+	}
+
+	/// Removes a node and everything below it.
+	void Remove(Node* node)
+	{
+		Node* parent = node->Parent;
+		auto it = std::find_if(parent->Children.begin(), parent->Children.end(),
+							   [node](const std::unique_ptr<Node>& child) { return child.get() == node; });
+
+		// Keep the node alive until the view has been told, but out of the child list so the view does not see it.
+		std::unique_ptr<Node> owned = std::move(*it);
+		parent->Children.erase(it);
+		ItemDeleted(ToItem(parent), ToItem(node));
+	}
+
+	void Clear()
+	{
+		mRoot->Children.clear();
+		Cleared();
+	}
+
+	/// Removes materials and models that have lost all their textures.
+	void Prune()
+	{
+		std::vector<Node*> empty;
+
+		for (const auto& top : mRoot->Children) {
+			if (top->Kind == eKind::Model) {
+				bool any_left = false;
+
+				for (const auto& material : top->Children) {
+					if (material->Children.empty()) {
+						empty.push_back(material.get());
+					}
+					else {
+						any_left = true;
+					}
+				}
+
+				if (!any_left) {
+					empty.push_back(top.get()); // the model goes, taking its empty materials with it
+				}
+			}
+			else if (top->Kind == eKind::Material && top->Children.empty()) {
+				empty.push_back(top.get());
+			}
+		}
+
+		std::set<Node*> doomed(empty.begin(), empty.end());
+
+		for (Node* node : empty) {
+			if (!doomed.count(node->Parent)) {
+				Remove(node);
+			}
+		}
+	}
+
+	Node* FindModel(const wxString& path) const
+	{
+		for (const auto& top : mRoot->Children) {
+			if (top->Kind == eKind::Model && top->Source == path) {
+				return top.get();
+			}
+		}
+		return nullptr;
+	}
+
+	Node* FindLooseMaterial() const
+	{
+		for (const auto& top : mRoot->Children) {
+			if (top->Kind == eKind::Material) {
+				return top.get();
+			}
+		}
+		return nullptr;
+	}
+
+	static Node* FindRole(const Node* material, eImageRole role, const Node* except = nullptr)
+	{
+		for (const auto& image : material->Children) {
+			if (image.get() != except && image->Role == role) {
+				return image.get();
+			}
+		}
+		return nullptr;
+	}
+
+	/// Every exportable material, in display order.
+	void CollectMaterials(std::vector<Node*>& out) const
+	{
+		for (const auto& top : mRoot->Children) {
+			if (top->Kind == eKind::Material) {
+				out.push_back(top.get());
+			}
+			else if (top->Kind == eKind::Model) {
+				for (const auto& material : top->Children) {
+					out.push_back(material.get());
+				}
+			}
+		}
+	}
+
+	// wxDataViewModel
+
+	unsigned GetColumnCount() const override { return 4; }
+
+	wxString GetColumnType(unsigned) const override { return "string"; }
+
+	void GetValue(wxVariant& variant, const wxDataViewItem& item, unsigned column) const override
+	{
+		const Node* node = ToNode(item);
+
+		if (!node) {
+			return;
+		}
+
+		switch (column) {
+		case 0:
+			variant = node->Name;
+			break;
+		case spcColumnRole:
+			variant = wxString(node->Kind == eKind::Image ? spcRoles[int(node->Role)] : "");
+			break;
+		case 2:
+			variant = node->SizeText;
+			break;
+		case 3:
+			variant = node->Source;
+			break;
+		}
+	}
+
+	bool SetValue(const wxVariant& variant, const wxDataViewItem& item, unsigned column) override
+	{
+		Node* node = ToNode(item);
+
+		if (column != spcColumnRole || !node || node->Kind != eKind::Image) {
+			return false;
+		}
+
+		const wxString text = variant.GetString();
+
+		for (int i = 0; i < int(std::size(spcRoles)); ++i) {
+			if (text == spcRoles[i]) {
+				SetRole(node, eImageRole(i));
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/// A role is held by one texture per material, so giving it to one frees it on the other.
+	void SetRole(Node* node, eImageRole role)
+	{
+		if (role != eImageRole::Unused) {
+			while (Node* other = FindRole(node->Parent, role, node)) {
+				other->Role = eImageRole::Unused;
+				ItemChanged(ToItem(other));
+			}
+		}
+
+		node->Role = role;
+	}
+
+	wxDataViewItem GetParent(const wxDataViewItem& item) const override
+	{
+		const Node* node = ToNode(item);
+		return node && node->Parent ? ToItem(node->Parent) : wxDataViewItem(nullptr);
+	}
+
+	bool IsContainer(const wxDataViewItem& item) const override
+	{
+		return !item.IsOk() || ToNode(item)->Kind != eKind::Image;
+	}
+
+	bool HasContainerColumns(const wxDataViewItem&) const override { return true; }
+
+	bool IsEnabled(const wxDataViewItem& item, unsigned column) const override
+	{
+		// Only textures have a role to choose.
+		return column != spcColumnRole || (item.IsOk() && ToNode(item)->Kind == eKind::Image);
+	}
+
+	unsigned GetChildren(const wxDataViewItem& item, wxDataViewItemArray& children) const override
+	{
+		const Node* node = item.IsOk() ? ToNode(item) : mRoot.get();
+
+		for (const auto& child : node->Children) {
+			children.Add(ToItem(child.get()));
+		}
+
+		return unsigned(node->Children.size());
+	}
+
+private:
+	std::unique_ptr<Node> mRoot;
+};
+
 // Shows one image scaled to fit, using nearest-neighbour when enlarging so
 // small mips look blocky.
 class ImageCanvas : public wxPanel
@@ -155,13 +432,16 @@ private:
 
 		if (mbDirty) {
 			const wxSize cs = GetClientSize();
-			const double scale = std::min(double(cs.x) / mImage.GetWidth(), double(cs.y) / mImage.GetHeight());
-			const int w = std::max(1, int(mImage.GetWidth() * scale));
-			const int h = std::max(1, int(mImage.GetHeight() * scale));
+			const double scale = std::min(static_cast<double>(cs.x) / mImage.GetWidth(),
+										  static_cast<double>(cs.y) / mImage.GetHeight());
+
+			const int w = std::max(1, static_cast<int>(mImage.GetWidth() * scale));
+			const int h = std::max(1, static_cast<int>(mImage.GetHeight() * scale));
 
 			mBitmap = wxBitmap(mImage.Scale(w, h, scale >= 1.0 ? wxIMAGE_QUALITY_NEAREST : wxIMAGE_QUALITY_HIGH));
 			mbDirty = false;
 		}
+
 		const wxSize cs = GetClientSize();
 		dc.DrawBitmap(mBitmap, (cs.x - mBitmap.GetWidth()) / 2, (cs.y - mBitmap.GetHeight()) / 2, true);
 	}
@@ -175,7 +455,7 @@ private:
 class MainFrame : public wxFrame
 {
 public:
-	MainFrame() : wxFrame(nullptr, wxID_ANY, "MeatPacker", wxDefaultPosition, wxSize(760, 820))
+	MainFrame() : wxFrame(nullptr, wxID_ANY, "MeatPacker", wxDefaultPosition, wxSize(850, 1000))
 	{
 		mConfig.Load();
 
@@ -190,7 +470,7 @@ public:
 		wxWindow* ip = inputs->GetStaticBox();
 
 		wxBoxSizer* buttons = new wxBoxSizer(wxHORIZONTAL);
-		wxButton* add_btn = new wxButton(ip, wxID_ANY, "Add Images");
+		wxButton* add_btn = new wxButton(ip, wxID_ANY, "Add...");
 		wxButton* remove_btn = new wxButton(ip, wxID_ANY, "Remove Selected");
 		wxButton* clear_btn = new wxButton(ip, wxID_ANY, "Clear");
 
@@ -199,19 +479,25 @@ public:
 		buttons->Add(clear_btn, 0);
 		inputs->Add(buttons, 0, wxALL, 6);
 
-		mpList = new wxDataViewListCtrl(ip, wxID_ANY, wxDefaultPosition, wxSize(-1, 170), wxDV_MULTIPLE);
-		mpList->AppendTextColumn("File", wxDATAVIEW_CELL_INERT, 200);
+		mpTree = new wxDataViewCtrl(ip, wxID_ANY, wxDefaultPosition, wxSize(-1, 230), wxDV_MULTIPLE | wxDV_ROW_LINES);
+		mpModel = new ImageTreeModel();
+		mpTree->AssociateModel(mpModel);
+		mpModel->DecRef(); // the control now owns it
+
 		wxArrayString role_choices;
 		for (const char* r : spcRoles) {
 			role_choices.Add(r);
 		}
-		mpList->AppendColumn(
-			new wxDataViewColumn("Role", new wxDataViewChoiceRenderer(role_choices, wxDATAVIEW_CELL_EDITABLE), 1, 170),
-			"string");
 
-		mpList->AppendTextColumn("Size", wxDATAVIEW_CELL_INERT, 90);
-		mpList->AppendTextColumn("Folder", wxDATAVIEW_CELL_INERT, 300);
-		inputs->Add(mpList, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 6);
+		wxDataViewColumn* name_column = mpTree->AppendTextColumn("Name", 0, wxDATAVIEW_CELL_INERT, 260);
+		mpTree->AppendColumn(new wxDataViewColumn("Role",
+												  new wxDataViewChoiceRenderer(role_choices, wxDATAVIEW_CELL_EDITABLE),
+												  ImageTreeModel::spcColumnRole, 170));
+		mpTree->AppendTextColumn("Size", 2, wxDATAVIEW_CELL_INERT, 90);
+		mpTree->AppendTextColumn("Source", 3, wxDATAVIEW_CELL_INERT, 300);
+		mpTree->SetExpanderColumn(name_column);
+
+		inputs->Add(mpTree, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 6);
 		root->Add(inputs, 0, wxEXPAND | wxALL, 8);
 
 		add_btn->Bind(wxEVT_BUTTON, &MainFrame::OnAddImages, this);
@@ -219,10 +505,10 @@ public:
 		clear_btn->Bind(wxEVT_BUTTON,
 						[this](wxCommandEvent&)
 						{
-							mpList->DeleteAllItems();
-							mPaths.clear();
+							mpModel->Clear();
+							RefreshMaterialList(nullptr);
 						});
-		mpList->Bind(wxEVT_DATAVIEW_ITEM_VALUE_CHANGED, &MainFrame::OnRoleChanged, this);
+		mpTree->Bind(wxEVT_DATAVIEW_SELECTION_CHANGED, &MainFrame::OnTreeSelection, this);
 
 		auto* defs = new wxStaticBoxSizer(wxVERTICAL, panel, "Fallback values");
 		auto* dgrid = new wxFlexGridSizer(2, 6, 8);
@@ -241,7 +527,17 @@ public:
 		AddSpinner("AO", 1.0, mpDefAmbientOcclusion);
 
 		defs->Add(dgrid, 0, wxALL, 6);
-		root->Add(defs, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+		auto* material_box = new wxStaticBoxSizer(wxVERTICAL, panel, "Material to export");
+		mpMaterialList = new wxListBox(material_box->GetStaticBox(), wxID_ANY, wxDefaultPosition, wxSize(-1, 60), 0,
+									   nullptr, wxLB_SINGLE);
+		material_box->Add(mpMaterialList, 1, wxEXPAND | wxALL, 6);
+		mpMaterialList->Bind(wxEVT_LISTBOX, &MainFrame::OnMaterialSelected, this);
+
+		auto* defs_row = new wxBoxSizer(wxHORIZONTAL);
+		defs_row->Add(defs, 0, wxEXPAND | wxRIGHT, 8);
+		defs_row->Add(material_box, 1, wxEXPAND);
+		root->Add(defs_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
 		auto* out = new wxStaticBoxSizer(wxVERTICAL, panel, "Output");
 		auto* ogrid = new wxFlexGridSizer(2, 6, 8);
@@ -335,8 +631,12 @@ public:
 		out->Add(mpSubfolder, 0, wxLEFT | wxBOTTOM, 8);
 		root->Add(out, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
-		auto* bake = new wxButton(panel, wxID_ANY, "Bake");
-		root->Add(bake, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+		auto* bake_all_button = new wxButton(panel, wxID_ANY, "Bake All");
+		root->Add(bake_all_button, 1, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+		auto* bake = new wxButton(panel, wxID_ANY, "Single Bake");
+		root->Add(bake, 1, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
 
 		mpTabs = new wxNotebook(panel, wxID_ANY);
 		mpLog = new wxTextCtrl(mpTabs, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_MULTILINE | wxTE_READONLY);
@@ -358,7 +658,7 @@ public:
 		vsizer->Add(left, 0, wxEXPAND | wxALL, 6);
 		vsizer->Add(mpCanvas, 1, wxEXPAND | wxALL, 6);
 		viewer->SetSizer(vsizer);
-		mpTabs->AddPage(viewer, "Mip viewer", true);
+		mpTabs->AddPage(viewer, "Mip Viewer", true);
 
 		root->Add(mpTabs, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
@@ -366,57 +666,22 @@ public:
 		mpLevelList->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) { ShowLevel(mpLevelList->GetSelection()); });
 
 		panel->SetSizer(root);
-		bake->Bind(wxEVT_BUTTON, &MainFrame::OnBake, this);
+
+		bake->Bind(wxEVT_BUTTON, &MainFrame::OnSingleBake, this);
+		bake_all_button->Bind(wxEVT_BUTTON, &MainFrame::OnBakeAll, this);
 	}
 
 private:
-	enum class eImageRole
-	{
-		Unused,
-		Diffuse,
-		Normal,
-		Roughness,
-		Metallic,
-		AmbientOcclusion
-	};
-
 	// Output resolution divisors offered in the UI; labels and values must stay in the same order.
 	static constexpr int spcDivisors[] = { 1, 2, 4, 8 };
 	static constexpr const char* spcDivisorLabels[] = { "Full size", "1/2 (half)", "1/4 (quarter)", "1/8 (eighth)" };
 
-	static constexpr const char* spcRoles[] = { "Unused",			"Diffuse / Base colour",
-												"Normal map",		"Roughness (ORM.G)",
-												"Metallic (ORM.B)", "AO (ORM.R)" };
-
-	eImageRole RoleOfRow(int row) const
-	{
-		wxString text = mpList->GetTextValue(row, 1);
-
-		for (int i = 0; i < 6; ++i) {
-			if (text == spcRoles[i]) {
-				return eImageRole(i);
-			}
-		}
-
-		return eImageRole::Unused;
-	}
-
-	int RowWithRole(eImageRole role, int except = -1) const
-	{
-		for (int row = 0; row < int(mPaths.size()); ++row) {
-			if (row != except && RoleOfRow(row) == role) {
-				return row;
-			}
-		}
-		return -1;
-	}
-
 	// Reads just the image header, so this is cheap even for large files.
-	static wxString GetImageSizeText(const wxString& path)
+	static wxString GetImageSizeText(const ImageSource& source)
 	{
-		int width = 0, height = 0, channels = 0;
+		int width = 0, height = 0;
 
-		if (!stbi_info(path.utf8_str(), &width, &height, &channels)) {
+		if (!GetImageSize(source, width, height)) {
 			return "unreadable";
 		}
 
@@ -495,16 +760,196 @@ private:
 		return std::nullopt;
 	}
 
+	using Node = ImageTreeModel::Node;
+
+	// The material picked in the "Material to export" list, if any.
+	Node* SelectedMaterial() const
+	{
+		const int index = mpMaterialList->GetSelection();
+		return index >= 0 && index < static_cast<int>(mMaterials.size()) ? mMaterials[index] : nullptr;
+	}
+
+	static wxString MaterialLabel(const Node* material)
+	{
+		if (material->Parent->Kind == ImageTreeModel::eKind::Model) {
+			return material->Parent->Name + " / " + material->Name;
+		}
+
+		return material->Name;
+	}
+
+	/// Rebuilds the material list. Keeps `preferred` selected if it exists, otherwise the material that was selected
+	/// before, otherwise the only material if there is just one.
+	void RefreshMaterialList(const Node* preferred)
+	{
+		const Node* previous = SelectedMaterial();
+
+		mMaterials.clear();
+		mpModel->CollectMaterials(mMaterials);
+		mpMaterialList->Clear();
+
+		int selection = mMaterials.size() == 1 ? 0 : -1;
+
+		for (int i = 0; i < int(mMaterials.size()); ++i) {
+			mpMaterialList->Append(MaterialLabel(mMaterials[i]));
+
+			if (mMaterials[i] == preferred || (!preferred && mMaterials[i] == previous)) {
+				selection = i;
+			}
+		}
+
+		if (selection >= 0) {
+			mpMaterialList->SetSelection(selection);
+			UpdateBaseName(mMaterials[selection]);
+		}
+	}
+
+	/// A glTF material names the set; loose images fall back to guessing from their file names.
+	void UpdateBaseName(const Node* material)
+	{
+		if (material->Parent->Kind == ImageTreeModel::eKind::Model) {
+			wxString name = material->Name;
+
+			for (const char* bad : { "/", "\\", ":" }) {
+				name.Replace(bad, "_");
+			}
+
+			mpName->SetValue(name);
+			return;
+		}
+
+		wxArrayString image_paths;
+		for (const auto& image : material->Children) {
+			image_paths.Add(wxString::FromUTF8(image->Image.Path));
+		}
+
+		auto base_name = FindCommonBaseName(image_paths);
+
+		if (base_name.has_value()) {
+			mpName->SetValue(base_name.value());
+		}
+	}
+
+	void ExpandNode(const Node* node) { mpTree->Expand(mpModel->ToItem(node)); }
+
+	void AddLooseImage(const wxString& path)
+	{
+		ImageSource source;
+		source.Path = path.utf8_string();
+
+		Node* loose = mpModel->FindLooseMaterial();
+
+		if (!loose) {
+			loose = mpModel->Add(mpModel->Root(), ImageTreeModel::eKind::Material, "Loose images");
+		}
+
+		for (const auto& image : loose->Children) {
+			if (image->Image == source) {
+				return;
+			}
+		}
+
+		// Only auto-assign a guessed role if nothing in this material already has it
+		eImageRole role = GuessRole(path);
+		if (role != eImageRole::Unused && ImageTreeModel::FindRole(loose, role)) {
+			role = eImageRole::Unused;
+		}
+
+		Node* node = mpModel->Add(loose, ImageTreeModel::eKind::Image, wxFileName(path).GetFullName(),
+								  wxFileName(path).GetPath(), GetImageSizeText(source));
+		node->Image = source;
+		node->Role = role;
+
+		ExpandNode(loose);
+	}
+
 	/**
-	 * @brief Adds images to the image pool. Auto assigns them roles
+	 * @brief Loads every material of a .gltf/.glb, each with its textures nested beneath it and their roles assigned
+	 * from the material's texture slots.
+	 * @return The first material added, if any.
+	 */
+	Node* AddGltfModel(const wxString& path)
+	{
+		if (mpModel->FindModel(path)) {
+			return nullptr;
+		}
+
+		std::vector<GltfMaterial> materials;
+		std::string error;
+
+		if (!ListGltfMaterials(path.utf8_string(), materials, error)) {
+			wxMessageBox(wxString::FromUTF8(error), "glTF error", wxOK | wxICON_ERROR, this);
+			return nullptr;
+		}
+
+		Node* model = mpModel->Add(mpModel->Root(), ImageTreeModel::eKind::Model, wxFileName(path).GetFullName(), path);
+		Node* first_material = nullptr;
+
+		struct SlotRole
+		{
+			const GltfTextureSlot& Slot;
+			eImageRole Role;
+			const char* Label;
+		};
+
+		for (const GltfMaterial& material : materials) {
+			const SlotRole slots[] = {
+				{ material.BaseColor, eImageRole::Diffuse, "Base Colour" },
+				{ material.Normal, eImageRole::Normal, "Normal Map" },
+				{ material.Occlusion, eImageRole::AmbientOcclusion, "AO (R)" },
+				{ material.Roughness, eImageRole::Roughness, "Roughness (G)" },
+				{ material.Metallic, eImageRole::Metallic, "Metallic (B)" },
+			};
+
+			Node* material_node = nullptr;
+
+			for (const SlotRole& entry : slots) {
+				if (entry.Slot.Empty()) {
+					continue;
+				}
+
+				if (!material_node) {
+					material_node = mpModel->Add(model, ImageTreeModel::eKind::Material,
+												 wxString::FromUTF8(material.Name), path);
+				}
+
+				const wxString size_text = entry.Slot.Width > 0
+											   ? wxString::Format("%d x %d", entry.Slot.Width, entry.Slot.Height)
+											   : wxString("unreadable");
+
+				Node* node = mpModel->Add(material_node, ImageTreeModel::eKind::Image, entry.Label, path, size_text);
+				node->Image = entry.Slot.Source;
+				node->Role = entry.Role;
+			}
+
+			if (material_node) {
+				ExpandNode(material_node);
+				first_material = first_material ? first_material : material_node;
+			}
+		}
+
+		if (!first_material) {
+			mpModel->Remove(model);
+			wxMessageBox(wxFileName(path).GetFullName() + " has no materials with textures.", "glTF",
+						 wxOK | wxICON_INFORMATION, this);
+			return nullptr;
+		}
+
+		ExpandNode(model);
+		return first_material;
+	}
+
+	/**
+	 * @brief Adds images to the input tree and auto-assigns their roles. A .gltf/.glb adds all of its materials,
+	 * each nested under the model.
 	 */
 	void OnAddImages(wxCommandEvent&)
 	{
-		const wxString wildcard = "Images (*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.psd;*.gif;*.hdr;*.pic;*.pnm)|"
-								  "*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.psd;*.gif;*.hdr;*.pic;*.pnm|All "
-								  "files|*.*";
+		const wxString wildcard = "Images and glTF models (*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.psd;*.gif;*.hdr;*.pic;*."
+								  "pnm;*.gltf;*.glb)|*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.psd;*.gif;*.hdr;*.pic;*.pnm;*."
+								  "gltf;*.glb|All files|*.*";
 
-		wxFileDialog dialog(this, "Select images", mLastDir, "", wildcard,
+		wxFileDialog dialog(this, "Select images or a glTF model", mLastDir, "", wildcard,
 							wxFD_OPEN | wxFD_MULTIPLE | wxFD_FILE_MUST_EXIST);
 
 		if (dialog.ShowModal() != wxID_OK) {
@@ -514,96 +959,126 @@ private:
 		wxArrayString paths;
 		dialog.GetPaths(paths);
 
-		for (const wxString& path : paths) {
-			if (mPaths.Index(path) != wxNOT_FOUND) {
-				continue;
-			}
+		const Node* to_select = nullptr;
+		bool added_loose = false;
 
+		for (const wxString& path : paths) {
 			mLastDir = wxFileName(path).GetPath();
 
-			// Only auto-assign a guessed role if nothing already has that role
-			eImageRole role = GuessRole(path);
-			if (role != eImageRole::Unused && RowWithRole(role) >= 0) {
-				role = eImageRole::Unused;
+			if (IsGltfPath(path.utf8_string())) {
+				if (const Node* material = AddGltfModel(path)) {
+					to_select = to_select ? to_select : material;
+				}
 			}
-
-			wxVector<wxVariant> row;
-
-			row.push_back(wxFileName(path).GetFullName());
-			row.push_back(wxString(spcRoles[int(role)]));
-			row.push_back(GetImageSizeText(path));
-			row.push_back(wxFileName(path).GetPath());
-
-			mpList->AppendItem(row);
-			mPaths.Add(path);
+			else {
+				AddLooseImage(path);
+				added_loose = true;
+			}
 		}
 
-		auto base_name = FindCommonBaseName(mPaths);
-
-		if (base_name.has_value()) {
-			mpName->SetValue(base_name.value());
+		// Prefer the newly loaded model's first material; otherwise the loose images.
+		if (!to_select && added_loose) {
+			to_select = mpModel->FindLooseMaterial();
 		}
+
+		RefreshMaterialList(to_select);
 	}
 
 	void OnRemoveSelected(wxCommandEvent&)
 	{
 		wxDataViewItemArray items;
-		mpList->GetSelections(items);
-		std::vector<int> rows;
+		mpTree->GetSelections(items);
 
+		std::set<Node*> selected;
 		for (const wxDataViewItem& item : items) {
-			rows.push_back(mpList->ItemToRow(item));
+			selected.insert(ImageTreeModel::ToNode(item));
 		}
 
-		std::sort(rows.rbegin(), rows.rend());
+		// Anything under a selected node goes with it.
+		std::vector<Node*> to_remove;
+		for (Node* node : selected) {
+			bool ancestor_selected = false;
 
-		for (int row : rows) {
-			mpList->DeleteItem(row);
-			mPaths.RemoveAt(row);
+			for (Node* a = node->Parent; a; a = a->Parent) {
+				ancestor_selected = ancestor_selected || selected.count(a) > 0;
+			}
+
+			if (!ancestor_selected) {
+				to_remove.push_back(node);
+			}
 		}
+
+		const Node* previous = SelectedMaterial();
+
+		for (Node* node : to_remove) {
+			mpModel->Remove(node);
+		}
+
+		mpModel->Prune();
+		RefreshMaterialList(previous);
 	}
 
-	// Each role holds one image; giving it to a new row frees it on the old one.
-	void OnRoleChanged(wxDataViewEvent& event)
+	// Choosing a material to export also shows it in the tree and names the output after it.
+	void OnMaterialSelected(wxCommandEvent&)
 	{
-		int row = mpList->ItemToRow(event.GetItem());
+		if (const Node* material = SelectedMaterial()) {
+			const wxDataViewItem item = mpModel->ToItem(material);
 
-		if (row == wxNOT_FOUND || event.GetColumn() != 1) {
-			return;
-		}
-
-		eImageRole role = RoleOfRow(row);
-
-		if (role == eImageRole::Unused) {
-			return;
-		}
-
-		for (int other; (other = RowWithRole(role, row)) >= 0;) {
-			mpList->SetTextValue(spcRoles[static_cast<int>(eImageRole::Unused)], other, 1);
+			mpTree->UnselectAll();
+			mpTree->Select(item);
+			mpTree->EnsureVisible(item);
+			UpdateBaseName(material);
 		}
 	}
 
-	void OnBake(wxCommandEvent&)
+	// Selecting anything in the tree picks the material it belongs to.
+	void OnTreeSelection(wxDataViewEvent& event)
+	{
+		Node* node = event.GetItem().IsOk() ? ImageTreeModel::ToNode(event.GetItem()) : nullptr;
+
+		while (node && node->Kind != ImageTreeModel::eKind::Material) {
+			node = node->Kind == ImageTreeModel::eKind::Image ? node->Parent : nullptr;
+		}
+
+		if (!node) {
+			return;
+		}
+
+		const auto it = std::find(mMaterials.begin(), mMaterials.end(), node);
+
+		if (it != mMaterials.end() && node != SelectedMaterial()) {
+			mpMaterialList->SetSelection(int(it - mMaterials.begin()));
+			UpdateBaseName(node);
+		}
+	}
+
+	void DoMaterialBake(Node* material)
 	{
 		BakeSettings bake_settings;
 
-		for (int row = 0; row < int(mPaths.size()); row++) {
-			std::string path = mPaths[row].ToStdString();
-			switch (RoleOfRow(row)) {
+		if (material == nullptr) {
+			mpLog->Clear();
+			mpLog->AppendText("Error: select a material to export.\n");
+			mpTabs->SetSelection(0);
+			return;
+		}
+
+		for (const auto& image : material->Children) {
+			switch (image->Role) {
 			case eImageRole::Diffuse:
-				bake_settings.PathDiffuse = path;
+				bake_settings.PathDiffuse = image->Image;
 				break;
 			case eImageRole::Normal:
-				bake_settings.PathNormalMap = path;
+				bake_settings.PathNormalMap = image->Image;
 				break;
 			case eImageRole::Roughness:
-				bake_settings.PathRoughness = path;
+				bake_settings.PathRoughness = image->Image;
 				break;
 			case eImageRole::Metallic:
-				bake_settings.PathMetallic = path;
+				bake_settings.PathMetallic = image->Image;
 				break;
 			case eImageRole::AmbientOcclusion:
-				bake_settings.PathAO = path;
+				bake_settings.PathAO = image->Image;
 				break;
 			case eImageRole::Unused:
 				break;
@@ -640,6 +1115,24 @@ private:
 			mpTabs->SetSelection(1);
 		}
 	}
+
+
+	/**
+	 * @brief Bake all materials in the materials list
+	 */
+	void OnBakeAll(wxCommandEvent&)
+	{
+		for (Node* node : mMaterials) {
+			if (node == nullptr) {
+				continue;
+			}
+
+			UpdateBaseName(node);
+			DoMaterialBake(node);
+		}
+	}
+
+	void OnSingleBake(wxCommandEvent&) { DoMaterialBake(SelectedMaterial()); }
 
 	// Reads the baked files back so the viewer shows exactly what is on disk.
 	void LoadViewer(const std::vector<std::string>& files)
@@ -703,8 +1196,10 @@ private:
 	}
 
 private:
-	wxDataViewListCtrl* mpList;
-	wxArrayString mPaths; // full path per list row
+	wxDataViewCtrl* mpTree;
+	ImageTreeModel* mpModel; // owned by mpTree
+	wxListBox* mpMaterialList;
+	std::vector<Node*> mMaterials; // parallel to the entries of mpMaterialList
 	wxString mLastDir;
 	wxSpinCtrlDouble *mpDefRoughness, *mpDefMetallic, *mpDefAmbientOcclusion;
 	wxTextCtrl *mpOutDir, *mpName, *mpLog;

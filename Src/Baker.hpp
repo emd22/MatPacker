@@ -1,16 +1,18 @@
 #pragma once
 
+#include "ImageSource.hpp"
+
 #include <functional>
 #include <string>
 #include <vector>
 
 struct BakeSettings
 {
-	std::string PathDiffuse;
-	std::string PathNormalMap;
-	std::string PathRoughness;
-	std::string PathMetallic;
-	std::string PathAO;
+	ImageSource PathDiffuse;
+	ImageSource PathNormalMap;
+	ImageSource PathRoughness;
+	ImageSource PathMetallic;
+	ImageSource PathAO;
 
 	float DefaultRoughness = 0.5f;
 	float DefaultMetallic = 0.0f;
