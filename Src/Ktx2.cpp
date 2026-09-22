@@ -108,8 +108,9 @@ std::string WriteKTX2(const std::string& path, const MPImage& base, eColorSpace 
 			params.uastcFlags = KTX_PACK_UASTC_LEVEL_DEFAULT;
 			params.compressionLevel = KTX_ETC1S_DEFAULT_COMPRESSION_LEVEL; // required by the API even for UASTC
 			params.threadCount = thread_count;
-			// Tunes the encoder for normal vectors and marks the texture as a normal map (linear data only).
-			params.normalMap = normal_map ? KTX_TRUE : KTX_FALSE;
+			// Left off for normal maps too as libktx's normalMap mode re-encodes to two channels (RGB = X, A = Y) and
+			// drops Z, but readers of these files expect XYZ in RGB.
+			params.normalMap = KTX_FALSE;
 
 			rc = ktxTexture2_CompressBasisEx(tex, &params);
 

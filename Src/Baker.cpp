@@ -42,7 +42,7 @@ uint8_t ToByte(float v) { return uint8_t(std::clamp(std::lround(v * 255.0f), 0L,
 } // namespace
 
 bool Bake(const BakeSettings& bake_settings, const std::function<void(const std::string&)>& log,
-		  std::vector<std::string>* written)
+		  BakeOutputs* outputs)
 {
 	namespace fs = std::filesystem;
 
@@ -73,7 +73,9 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 	int diffuse_w = 0, diffuse_h = 0;
 	std::string err;
 
-	auto OutputImage = [&](const std::string& path, const MPImage& img, eColorSpace cs, bool normal)
+	// Writes `img` to `path`, recording the path in `output` on success.
+	auto OutputImage = [&](const std::string& path, const MPImage& img, eColorSpace cs, bool normal,
+						   std::string BakeOutputs::* output)
 	{
 		MPImage scaled;
 		if (bake_settings.ResolutionDivisor > 1) {
@@ -85,8 +87,8 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 
 		std::string e = WriteKTX2(path, out_img, cs, bake_settings.bExportMipmaps, normal, bake_settings.Compression);
 		if (e.empty()) {
-			if (written) {
-				written->push_back(path);
+			if (outputs) {
+				outputs->*output = path;
 			}
 
 			log("Wrote " + path + " (" + std::to_string(out_img.Width) + "x" + std::to_string(out_img.Height) + ")");
@@ -108,7 +110,7 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 		else {
 			diffuse_w = l.RGBAImage.Width;
 			diffuse_h = l.RGBAImage.Height;
-			OutputImage(MakeOutputPath("_diffuse"), l.RGBAImage, eColorSpace::SRGB, false);
+			OutputImage(MakeOutputPath("_diffuse"), l.RGBAImage, eColorSpace::SRGB, false, &BakeOutputs::Diffuse);
 		}
 	}
 	else {
@@ -127,7 +129,7 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 				l.RGBAImage.Pixels[i] = 255;
 			}
 
-			OutputImage(MakeOutputPath("_normal"), l.RGBAImage, eColorSpace::Linear, true);
+			OutputImage(MakeOutputPath("_normal"), l.RGBAImage, eColorSpace::Linear, true, &BakeOutputs::Normal);
 		}
 	}
 	else {
@@ -208,6 +210,6 @@ bool Bake(const BakeSettings& bake_settings, const std::function<void(const std:
 		orm.Pixels[i] = 255;
 	}
 
-	OutputImage(MakeOutputPath("_orm"), orm, eColorSpace::Linear, false);
+	OutputImage(MakeOutputPath("_orm"), orm, eColorSpace::Linear, false, &BakeOutputs::Orm);
 	return all_ok;
 }

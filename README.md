@@ -11,6 +11,7 @@ A tool designed to convert images into KTX2 textures and pack them into game rea
 - Scale down materials to 1/2, 1/4, or 1/8th size
 - Export all images as compressed KTX2 images, ready to be used in game engines
 - Preview mips for each baked texture after baking
+- Export a copy of a GLTF model with its materials linked to the baked KTX2 textures (via `KHR_texture_basisu`), optionally embedding the textures in the file
 
 ## Output
 

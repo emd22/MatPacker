@@ -6,6 +6,16 @@
 #include <string>
 #include <vector>
 
+
+/**
+ * @brief The order to pack components in
+ */
+enum class eORMPackOrder
+{
+	ORM, // AO, Roughness, Metallic
+	OMR, // AO, Metallic, Roughness
+};
+
 struct BakeSettings
 {
 	ImageSource PathDiffuse;
@@ -32,8 +42,29 @@ struct BakeSettings
 	eTextureCompression Compression = eTextureCompression::None;
 };
 
+// Paths of the files a bake wrote; empty where that output was skipped or failed.
+struct BakeOutputs
+{
+	std::string Diffuse;
+	std::string Normal;
+	std::string Orm;
+
+	std::vector<std::string> All() const
+	{
+		std::vector<std::string> all;
+
+		for (const std::string* path : { &Diffuse, &Normal, &Orm }) {
+			if (!path->empty()) {
+				all.push_back(*path);
+			}
+		}
+
+		return all;
+	}
+};
+
 // Bakes the configured textures to <outputDir>/<baseName>_{diffuse,normal,orm}.ktx2.
-// Progress and errors are reported through `log`; paths of successfully written files are appended to
-// `written` if given. Returns true if every requested output succeeded.
+// Progress and errors are reported through `log`; paths of successfully written files are stored in `outputs` if
+// given. Returns true if every requested output succeeded.
 bool Bake(const BakeSettings& settings, const std::function<void(const std::string&)>& log,
-		  std::vector<std::string>* written = nullptr);
+		  BakeOutputs* outputs = nullptr);

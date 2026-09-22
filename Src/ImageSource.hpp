@@ -44,6 +44,7 @@ struct GltfTextureSlot
 struct GltfMaterial
 {
 	std::string Name;
+	int Index = -1; // index into the glTF's materials
 
 	GltfTextureSlot BaseColor;
 	GltfTextureSlot Normal;

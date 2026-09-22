@@ -1,4 +1,5 @@
 #include "Baker.hpp"
+#include "GltfExport.hpp"
 #include "ImageSource.hpp"
 #include "Ktx2.hpp"
 
@@ -50,6 +51,10 @@ public:
 			mbCreateSubfolder = ini[spcSectionOutput][spcKeyCreateSubfolder] == "1";
 		}
 
+		if (ini.has(spcSectionOutput) && ini[spcSectionOutput].has(spcKeyEmbedTextures)) {
+			mbEmbedTextures = ini[spcSectionOutput][spcKeyEmbedTextures] == "1";
+		}
+
 		if (ini.has(spcSectionOutput) && ini[spcSectionOutput].has(spcKeyCompression)) {
 			try {
 				const int value = std::stoi(ini[spcSectionOutput][spcKeyCompression]);
@@ -83,6 +88,7 @@ public:
 		ini[spcSectionOutput][spcKeyResolutionDivisor] = std::to_string(mResolutionDivisor);
 		ini[spcSectionOutput][spcKeyCompression] = std::to_string(int(mCompression));
 		ini[spcSectionOutput][spcKeyCreateSubfolder] = mbCreateSubfolder ? "1" : "0";
+		ini[spcSectionOutput][spcKeyEmbedTextures] = mbEmbedTextures ? "1" : "0";
 
 		return file.write(ini, true);
 	}
@@ -99,6 +105,9 @@ public:
 	bool GetCreateSubfolder() const { return mbCreateSubfolder; }
 	void SetCreateSubfolder(bool create) { mbCreateSubfolder = create; }
 
+	bool GetEmbedTextures() const { return mbEmbedTextures; }
+	void SetEmbedTextures(bool embed) { mbEmbedTextures = embed; }
+
 private:
 	static std::string GetFilePath()
 	{
@@ -111,11 +120,13 @@ private:
 	static constexpr const char* spcKeyResolutionDivisor = "ResolutionDivisor";
 	static constexpr const char* spcKeyCompression = "Compression";
 	static constexpr const char* spcKeyCreateSubfolder = "CreateSubfolder";
+	static constexpr const char* spcKeyEmbedTextures = "EmbedTextures";
 
 	std::string mDefaultOutputDir;
 	int mResolutionDivisor = 1;
 	eTextureCompression mCompression = eTextureCompression::None;
 	bool mbCreateSubfolder = false;
+	bool mbEmbedTextures = false;
 };
 
 enum class eImageRole
@@ -159,6 +170,7 @@ public:
 		wxString Source; // file or folder the entry came from
 		eImageRole Role = eImageRole::Unused;
 		ImageSource Image; // Image nodes only
+		int GltfMaterialIndex = -1; // Material nodes of a model only: index into the glTF's materials
 	};
 
 	static constexpr unsigned spcColumnRole = 1;
@@ -666,6 +678,23 @@ public:
 						  });
 
 		out->Add(mpSubfolder, 0, wxLEFT | wxBOTTOM, 8);
+
+		mpEmbedTextures = new wxCheckBox(out->GetStaticBox(), wxID_ANY, "Embed Textures in glTF Export");
+		mpEmbedTextures->SetToolTip("Store the baked textures inside the exported .glb (or as data URIs in a .gltf) "
+									"instead of linking to the .ktx2 files.");
+
+		mpEmbedTextures->SetValue(mConfig.GetEmbedTextures());
+		mpEmbedTextures->Bind(wxEVT_CHECKBOX,
+							  [this](wxCommandEvent&)
+							  {
+								  mConfig.SetEmbedTextures(mpEmbedTextures->GetValue());
+
+								  if (!mConfig.Save()) {
+									  mpLog->AppendText("Error: could not save the embed textures setting.\n");
+								  }
+							  });
+
+		out->Add(mpEmbedTextures, 0, wxLEFT | wxBOTTOM, 8);
 		root->Add(out, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
 		auto* bake_all_button = new wxButton(panel, wxID_ANY, "Bake All");
@@ -673,6 +702,11 @@ public:
 
 		auto* bake = new wxButton(panel, wxID_ANY, "Single Bake");
 		root->Add(bake, 1, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+		auto* export_gltf_button = new wxButton(panel, wxID_ANY, "Bake && Export glTF...");
+		export_gltf_button->SetToolTip("Bakes every material of the selected material's model, then saves a copy of "
+									   "the model with its materials linked to the baked textures.");
+		root->Add(export_gltf_button, 1, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
 
 		mpTabs = new wxNotebook(panel, wxID_ANY);
@@ -706,6 +740,7 @@ public:
 
 		bake->Bind(wxEVT_BUTTON, &MainFrame::OnSingleBake, this);
 		bake_all_button->Bind(wxEVT_BUTTON, &MainFrame::OnBakeAll, this);
+		export_gltf_button->Bind(wxEVT_BUTTON, &MainFrame::OnExportGltf, this);
 	}
 
 private:
@@ -953,6 +988,7 @@ private:
 				if (!material_node) {
 					material_node = mpModel->Add(model, ImageTreeModel::eKind::Material,
 												 wxString::FromUTF8(material.Name), path);
+					material_node->GltfMaterialIndex = material.Index;
 				}
 
 				const wxString size_text = entry.Slot.Width > 0
@@ -1094,15 +1130,15 @@ private:
 		}
 	}
 
-	void DoMaterialBake(Node* material)
+	/// Bakes one material, appending to the log. Returns true if every output was written.
+	bool DoMaterialBake(Node* material, BakeOutputs* outputs = nullptr)
 	{
 		BakeSettings bake_settings;
 
 		if (material == nullptr) {
-			mpLog->Clear();
 			mpLog->AppendText("Error: select a material to export.\n");
 			mpTabs->SetSelection(0);
-			return;
+			return false;
 		}
 
 		for (const auto& image : material->Children) {
@@ -1137,9 +1173,8 @@ private:
 		bake_settings.ResolutionDivisor = spcDivisors[std::max(0, mpDivisor->GetSelection())];
 		bake_settings.Compression = eTextureCompression(std::max(0, mpCompression->GetSelection()));
 
-		mpLog->Clear();
 		wxBusyCursor busy;
-		std::vector<std::string> written;
+		BakeOutputs baked;
 
 		bool ok = Bake(
 			bake_settings,
@@ -1148,15 +1183,22 @@ private:
 				mpLog->AppendText(wxString::FromUTF8(line) + "\n");
 				wxYield();
 			},
-			&written);
+			&baked);
 
 		mpLog->AppendText(ok ? "Done.\n" : "Finished with errors.\n");
 
+		const std::vector<std::string> written = baked.All();
 		LoadViewer(written);
 
 		if (ok && !written.empty()) {
 			mpTabs->SetSelection(1);
 		}
+
+		if (outputs) {
+			*outputs = baked;
+		}
+
+		return ok;
 	}
 
 
@@ -1165,6 +1207,8 @@ private:
 	 */
 	void OnBakeAll(wxCommandEvent&)
 	{
+		mpLog->Clear();
+
 		for (Node* node : mMaterials) {
 			if (node == nullptr) {
 				continue;
@@ -1175,7 +1219,90 @@ private:
 		}
 	}
 
-	void OnSingleBake(wxCommandEvent&) { DoMaterialBake(SelectedMaterial()); }
+	void OnSingleBake(wxCommandEvent&)
+	{
+		mpLog->Clear();
+		DoMaterialBake(SelectedMaterial());
+	}
+
+	/**
+	 * @brief Bakes every material of the selected material's glTF model, then saves a copy of the model whose materials
+	 * use the baked .ktx2 textures in place of their original images.
+	 */
+	void OnExportGltf(wxCommandEvent&)
+	{
+		mpLog->Clear();
+
+		const Node* selected = SelectedMaterial();
+		const Node* model = selected ? selected->Parent : nullptr;
+
+		if (!model || model->Kind != ImageTreeModel::eKind::Model) {
+			mpLog->AppendText("Error: select a material from a glTF model to export.\n");
+			mpTabs->SetSelection(0);
+			return;
+		}
+
+		const wxFileName source(model->Source);
+		const bool is_glb = source.GetExt().Lower() == "glb";
+		const wxString default_dir = mpOutDir->IsEmpty() ? source.GetPath() : mpOutDir->GetValue();
+
+		wxFileDialog dialog(this, "Save glTF with baked materials", default_dir,
+							source.GetName() + "_baked." + source.GetExt(),
+							"glTF (*.gltf)|*.gltf|Binary glTF (*.glb)|*.glb", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+		dialog.SetFilterIndex(is_glb ? 1 : 0);
+
+		if (dialog.ShowModal() != wxID_OK) {
+			return;
+		}
+
+		wxFileName output(dialog.GetPath());
+
+		if (!IsGltfPath(output.GetFullPath().utf8_string())) {
+			output.SetExt(dialog.GetFilterIndex() == 1 ? "glb" : "gltf");
+		}
+
+		std::vector<BakedMaterialLink> links;
+		bool all_ok = true;
+
+		for (const auto& material : model->Children) {
+			if (material->GltfMaterialIndex < 0) {
+				continue;
+			}
+
+			mpLog->AppendText("\n== " + material->Name + " ==\n");
+			UpdateBaseName(material.get());
+
+			BakeOutputs baked;
+			all_ok = DoMaterialBake(material.get(), &baked) && all_ok;
+
+			// Link only the slots this material has a source for, so a slot never picks up the fallback values.
+			const bool has_orm_components = ImageTreeModel::FindRole(material.get(), eImageRole::Roughness) ||
+											ImageTreeModel::FindRole(material.get(), eImageRole::Metallic);
+
+			BakedMaterialLink link;
+			link.MaterialIndex = material->GltfMaterialIndex;
+			link.BaseColor = baked.Diffuse;
+			link.Normal = baked.Normal;
+			link.MetallicRoughness = has_orm_components ? baked.Orm : std::string();
+			link.Occlusion = ImageTreeModel::FindRole(material.get(), eImageRole::AmbientOcclusion) ? baked.Orm
+																									: std::string();
+			links.push_back(link);
+		}
+
+		mpLog->AppendText("\n");
+
+		std::string error;
+		const bool exported = ExportGltfWithBakedMaterials(
+			model->Source.utf8_string(), output.GetFullPath().utf8_string(), links, mpEmbedTextures->GetValue(),
+			[this](const std::string& line) { mpLog->AppendText(wxString::FromUTF8(line) + "\n"); }, error);
+
+		if (!exported) {
+			mpLog->AppendText("Error: " + wxString::FromUTF8(error) + "\n");
+		}
+
+		mpLog->AppendText(exported && all_ok ? "Export done.\n" : "Export finished with errors.\n");
+		mpTabs->SetSelection(0);
+	}
 
 	// Reads the baked files back so the viewer shows exactly what is on disk.
 	void LoadViewer(const std::vector<std::string>& files)
@@ -1248,6 +1375,7 @@ private:
 	wxTextCtrl *mpOutDir, *mpName, *mpLog;
 	wxCheckBox* mpMips;
 	wxCheckBox* mpSubfolder;
+	wxCheckBox* mpEmbedTextures;
 	wxChoice* mpDivisor;
 	wxChoice* mpCompression;
 	wxNotebook* mpTabs;

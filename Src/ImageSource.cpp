@@ -252,6 +252,7 @@ bool ListGltfMaterials(const std::string& path, std::vector<GltfMaterial>& mater
 
 		GltfMaterial info;
 		info.Name = material.name ? material.name : "Material " + std::to_string(i);
+		info.Index = int(i);
 
 		if (material.has_pbr_metallic_roughness) {
 			const cgltf_pbr_metallic_roughness& pbr = material.pbr_metallic_roughness;
