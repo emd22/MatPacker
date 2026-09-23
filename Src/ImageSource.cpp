@@ -142,7 +142,7 @@ bool FetchGltfImage(const cgltf_data* data, int index, const std::string& gltf_p
 // Loads the encoded image for `source`, whether it is a plain file or lives in a glTF.
 bool FetchImage(const ImageSource& source, EncodedImage& encoded, std::string& error)
 {
-	if (source.GltfImageIndex < 0) {
+	if (source.GLTFImageIndex < 0) {
 		encoded.FilePath = source.Path;
 		return true;
 	}
@@ -153,8 +153,8 @@ bool FetchImage(const ImageSource& source, EncodedImage& encoded, std::string& e
 		return false;
 	}
 
-	const bool in_buffer_view = source.GltfImageIndex < int(gltf.Data->images_count) &&
-								gltf.Data->images[source.GltfImageIndex].buffer_view != nullptr;
+	const bool in_buffer_view = source.GLTFImageIndex < int(gltf.Data->images_count) &&
+								gltf.Data->images[source.GLTFImageIndex].buffer_view != nullptr;
 
 	if (in_buffer_view) {
 		cgltf_options options = {};
@@ -166,16 +166,16 @@ bool FetchImage(const ImageSource& source, EncodedImage& encoded, std::string& e
 		}
 	}
 
-	return FetchGltfImage(gltf.Data, source.GltfImageIndex, source.Path, encoded, error);
+	return FetchGltfImage(gltf.Data, source.GLTFImageIndex, source.Path, encoded, error);
 }
 
 std::string DescribeSource(const ImageSource& source)
 {
-	if (source.GltfImageIndex < 0) {
+	if (source.GLTFImageIndex < 0) {
 		return source.Path;
 	}
 
-	return source.Path + " (image " + std::to_string(source.GltfImageIndex) + ")";
+	return source.Path + " (image " + std::to_string(source.GLTFImageIndex) + ")";
 }
 
 // Decodes to `desired_components` interleaved 8-bit components.
@@ -219,7 +219,7 @@ GltfTextureSlot MakeSlot(const cgltf_data* data, const cgltf_texture* texture, c
 	}
 
 	slot.Source.Path = path;
-	slot.Source.GltfImageIndex = int(cgltf_image_index(data, texture->image));
+	slot.Source.GLTFImageIndex = int(cgltf_image_index(data, texture->image));
 	slot.Source.Channel = channel;
 	return slot;
 }
@@ -295,7 +295,7 @@ bool ListGltfMaterials(const std::string& path, std::vector<GltfMaterial>& mater
 			std::string ignored;
 			int components = 0;
 
-			if (!FetchGltfImage(data, slot->Source.GltfImageIndex, path, encoded, ignored)) {
+			if (!FetchGltfImage(data, slot->Source.GLTFImageIndex, path, encoded, ignored)) {
 				continue;
 			}
 

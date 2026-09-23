@@ -15,7 +15,7 @@ struct ImageSource
 	std::string Path;
 
 	// >= 0: index into the glTF's images (Path is then a .gltf/.glb). -1: Path is an image file.
-	int GltfImageIndex = -1;
+	int GLTFImageIndex = -1;
 
 	// Which channel to read when a single component is wanted (0 = R, 1 = G, 2 = B, 3 = A).
 	// -1 reads the whole image (RGBA), or its luminance when a single component is requested.
@@ -25,7 +25,7 @@ struct ImageSource
 
 	bool operator==(const ImageSource& other) const
 	{
-		return Path == other.Path && GltfImageIndex == other.GltfImageIndex && Channel == other.Channel;
+		return Path == other.Path && GLTFImageIndex == other.GLTFImageIndex && Channel == other.Channel;
 	}
 };
 

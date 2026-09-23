@@ -2,6 +2,7 @@
 
 #include "Json.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -172,11 +173,19 @@ std::string EncodeUri(const std::string& path)
 	return out;
 }
 
+// `path` made absolute, or left as it is if the current directory cannot be read.
+fs::path Absolute(const fs::path& path)
+{
+	std::error_code ec;
+	fs::path absolute = fs::absolute(path, ec);
+	return ec ? path : absolute;
+}
+
 // A URI for `target` as seen from the folder `from_dir`: relative when possible, otherwise absolute.
 std::string MakeUri(const fs::path& target, const fs::path& from_dir)
 {
-	const fs::path absolute_target = fs::absolute(target).lexically_normal();
-	const fs::path relative = absolute_target.lexically_relative(fs::absolute(from_dir).lexically_normal());
+	const fs::path absolute_target = Absolute(target).lexically_normal();
+	const fs::path relative = absolute_target.lexically_relative(Absolute(from_dir).lexically_normal());
 
 	return EncodeUri((relative.empty() ? absolute_target : relative).generic_u8string());
 }
@@ -290,19 +299,223 @@ void EnsureGlbBuffer(JsonValue& root)
 	}
 }
 
+bool EndsWith(const std::string& text, const char* suffix)
+{
+	const size_t length = std::strlen(suffix);
+	return text.size() >= length && text.compare(text.size() - length, length, suffix) == 0;
+}
+
+// Calls `fn` on the value of every member named `key`, anywhere under `value`.
+void ForEachMember(JsonValue& value, const char* key, const std::function<void(JsonValue&)>& fn)
+{
+	if (value.IsObject()) {
+		for (JsonMember& member : value.Object) {
+			if (member.Key == key) {
+				fn(member.Value);
+			}
+
+			ForEachMember(member.Value, key, fn);
+		}
+	}
+	else if (value.IsArray()) {
+		for (JsonValue& element : value.Array) {
+			ForEachMember(element, key, fn);
+		}
+	}
+}
+
+// Calls `fn` on the index of every texture info under `value`: any "...Texture" object, which covers the core slots
+// and those of material extensions (clearcoatTexture, sheenColorTexture, ...).
+void ForEachTextureIndex(JsonValue& value, const std::function<void(JsonValue&)>& fn)
+{
+	if (value.IsObject()) {
+		for (JsonMember& member : value.Object) {
+			if (EndsWith(member.Key, "Texture") && member.Value.IsObject()) {
+				if (JsonValue* index = member.Value.Find("index")) {
+					fn(*index);
+				}
+			}
+
+			ForEachTextureIndex(member.Value, fn);
+		}
+	}
+	else if (value.IsArray()) {
+		for (JsonValue& element : value.Array) {
+			ForEachTextureIndex(element, fn);
+		}
+	}
+}
+
+// Calls `fn` on every image index of a texture: its core `source` and the `source` of any extension (KTX2, WebP, ...).
+void ForEachImageIndex(JsonValue& texture, const std::function<void(JsonValue&)>& fn)
+{
+	if (JsonValue* source = texture.Find("source")) {
+		fn(*source);
+	}
+
+	if (JsonValue* extensions = texture.Find("extensions"); extensions && extensions->IsObject()) {
+		for (JsonMember& extension : extensions->Object) {
+			if (JsonValue* source = extension.Value.Find("source")) {
+				fn(*source);
+			}
+		}
+	}
+}
+
+/**
+ * @brief Removes the entries of `array` that nothing refers to. `for_each_ref` must call its argument on every
+ * reference to an entry; it is called once to find the used entries and once more to renumber them.
+ * @return The number of entries removed.
+ */
+size_t RemoveUnreferenced(JsonValue* array,
+						  const std::function<void(const std::function<void(JsonValue&)>&)>& for_each_ref)
+{
+	if (!array || !array->IsArray()) {
+		return 0;
+	}
+
+	const size_t count = array->Array.size();
+	std::vector<bool> used(count, false);
+
+	for_each_ref(
+		[&](JsonValue& ref)
+		{
+			const long long index = ref.AsInt();
+
+			if (index >= 0 && size_t(index) < count) {
+				used[size_t(index)] = true;
+			}
+		});
+
+	std::vector<long long> remap(count, -1);
+	std::vector<JsonValue> kept;
+
+	for (size_t i = 0; i < count; i++) {
+		if (used[i]) {
+			remap[i] = (long long)kept.size();
+			kept.push_back(std::move(array->Array[i]));
+		}
+	}
+
+	if (kept.size() == count) {
+		array->Array = std::move(kept);
+		return 0;
+	}
+
+	for_each_ref(
+		[&](JsonValue& ref)
+		{
+			const long long index = ref.AsInt();
+
+			if (index >= 0 && size_t(index) < count) {
+				ref = JsonValue::MakeNumber(remap[size_t(index)]);
+			}
+		});
+
+	array->Array = std::move(kept);
+	return count - array->Array.size();
+}
+
+/**
+ * @brief Drops the textures, images and buffer views left unused after relinking, then repacks the glb binary chunk
+ * (`bin`, which is buffer 0) so the bytes of the removed views are gone too.
+ */
+void RemoveUnused(JsonValue& root, std::string& bin, const std::function<void(const std::string&)>& log)
+{
+	JsonValue* materials = root.Find("materials");
+	JsonValue* textures = root.Find("textures");
+	JsonValue* images = root.Find("images");
+	JsonValue* views = root.Find("bufferViews");
+
+	const size_t removed_textures = RemoveUnreferenced(textures,
+													   [&](const std::function<void(JsonValue&)>& fn)
+													   {
+														   if (materials) {
+															   ForEachTextureIndex(*materials, fn);
+														   }
+													   });
+
+	const size_t removed_images = RemoveUnreferenced(images,
+													 [&](const std::function<void(JsonValue&)>& fn)
+													 {
+														 if (textures && textures->IsArray()) {
+															 for (JsonValue& texture : textures->Array) {
+																 ForEachImageIndex(texture, fn);
+															 }
+														 }
+													 });
+
+	// Anything may name a buffer view (accessors, sparse data, images, Draco and other extensions), so every
+	// "bufferView" member in the document counts.
+	const size_t removed_views = RemoveUnreferenced(views, [&](const std::function<void(JsonValue&)>& fn)
+													{ ForEachMember(root, "bufferView", fn); });
+
+	if (removed_textures || removed_images) {
+		log("Removed " + std::to_string(removed_textures) + " unused textures and " + std::to_string(removed_images) +
+			" unused images.");
+	}
+
+	if (bin.empty() || !views || !views->IsArray() || removed_views == 0) {
+		return;
+	}
+
+	// Meshopt views point at compressed data by offset in their extension, which a repack would have to rewrite too.
+	bool has_meshopt = false;
+
+	ForEachMember(*views, "EXT_meshopt_compression", [&](JsonValue&) { has_meshopt = true; });
+	ForEachMember(*views, "KHR_meshopt_compression", [&](JsonValue&) { has_meshopt = true; });
+
+	if (has_meshopt) {
+		log("Warning: the model uses meshopt compression, so unused binary data was left in place.");
+		return;
+	}
+
+	std::string packed;
+	packed.reserve(bin.size());
+
+	for (JsonValue& view : views->Array) {
+		const JsonValue* buffer = view.Find("buffer");
+
+		if (!buffer || buffer->AsInt() != 0) {
+			continue;
+		}
+
+		const JsonValue* offset_value = view.Find("byteOffset");
+		const JsonValue* length_value = view.Find("byteLength");
+		const size_t offset = offset_value ? size_t(std::max(0LL, offset_value->AsInt(0))) : 0;
+		const size_t length = length_value ? size_t(std::max(0LL, length_value->AsInt(0))) : 0;
+
+		if (offset + length > bin.size()) {
+			continue; // out of range already; leave it for the reader to report
+		}
+
+		// Keep the offset's alignment within 16 bytes, so accessors in the view stay aligned to their components.
+		size_t start = (packed.size() + 15) / 16 * 16 + offset % 16;
+		packed.resize(start, '\0');
+		packed.append(bin, offset, length);
+
+		view["byteOffset"] = JsonValue::MakeNumber((long long)start);
+	}
+
+	log("Removed " + std::to_string(removed_views) + " unused buffer views (" +
+		std::to_string((bin.size() - std::min(bin.size(), packed.size())) / 1024) + " KB).");
+	bin = std::move(packed);
+}
+
 /**
  * @brief Adds images and textures for baked .ktx2 files, reusing them when the same file (and sampler) is linked
  * more than once, such as the ORM texture for both occlusion and metallic-roughness.
  * Images are referenced by URI, or embedded: into the glb's binary chunk when `bin` and `buffer_views` are given,
- * otherwise as base64 data URIs.
+ * otherwise as base64 data URIs. Textures name their image through KHR_texture_basisu, or through the core `source`
+ * when `use_basisu` is off.
  */
 class TextureLinker
 {
 public:
-	TextureLinker(JsonValue& images, JsonValue& textures, const fs::path& output_dir, bool embed,
+	TextureLinker(JsonValue& images, JsonValue& textures, const fs::path& output_dir, bool embed, bool use_basisu,
 				  std::string* bin = nullptr, JsonValue* buffer_views = nullptr)
-		: mImages(images), mTextures(textures), mOutputDir(output_dir), mbEmbed(embed), mpBin(bin),
-		  mpBufferViews(buffer_views)
+		: mImages(images), mTextures(textures), mOutputDir(output_dir), mbEmbed(embed), mbUseBasisu(use_basisu),
+		  mpBin(bin), mpBufferViews(buffer_views)
 	{
 	}
 
@@ -399,7 +612,12 @@ private:
 			texture["sampler"] = JsonValue::MakeNumber(sampler);
 		}
 
-		texture["extensions"][spcBasisuExtension]["source"] = JsonValue::MakeNumber(image);
+		if (mbUseBasisu) {
+			texture["extensions"][spcBasisuExtension]["source"] = JsonValue::MakeNumber(image);
+		}
+		else {
+			texture["source"] = JsonValue::MakeNumber(image);
+		}
 
 		mTextures.Array.push_back(std::move(texture));
 		return mTextureByImage[key] = (long long)(mTextures.Array.size() - 1);
@@ -410,6 +628,7 @@ private:
 	fs::path mOutputDir;
 
 	bool mbEmbed = false;
+	bool mbUseBasisu = true;
 	std::string* mpBin = nullptr;
 	JsonValue* mpBufferViews = nullptr;
 
@@ -420,11 +639,12 @@ private:
 } // namespace
 
 bool ExportGltfWithBakedMaterials(const std::string& source_path, const std::string& output_path,
-								  const std::vector<BakedMaterialLink>& links, bool embed_textures,
+								  const std::vector<BakedMaterialLink>& links, const GltfExportOptions& options,
 								  const std::function<void(const std::string&)>& log, std::string& error)
 {
-	const fs::path source_dir = fs::absolute(fs::u8path(source_path)).parent_path();
-	const fs::path output_dir = fs::absolute(fs::u8path(output_path)).parent_path();
+	const bool embed_textures = options.bEmbedTextures;
+	const fs::path source_dir = Absolute(fs::u8path(source_path)).parent_path();
+	const fs::path output_dir = Absolute(fs::u8path(output_path)).parent_path();
 	const bool output_glb = HasExtension(output_path, ".glb");
 	const bool embed_in_bin = embed_textures && output_glb;
 
@@ -465,7 +685,8 @@ bool ExportGltfWithBakedMaterials(const std::string& source_path, const std::str
 
 	JsonValue* materials = root.Find("materials");
 	TextureLinker linker(*root.Find("images"), *root.Find("textures"), output_dir, embed_textures,
-						 embed_in_bin ? &bin : nullptr, embed_in_bin ? root.Find("bufferViews") : nullptr);
+						 options.bUseBasisUExtension, embed_in_bin ? &bin : nullptr,
+						 embed_in_bin ? root.Find("bufferViews") : nullptr);
 	int linked = 0;
 
 	for (const BakedMaterialLink& link : links) {
@@ -481,14 +702,13 @@ bool ExportGltfWithBakedMaterials(const std::string& source_path, const std::str
 			material = JsonValue::MakeObject();
 		}
 
-		const bool ok =
-			(link.BaseColor.empty() ||
-			 linker.Link(material["pbrMetallicRoughness"]["baseColorTexture"], link.BaseColor, error)) &&
-			(link.MetallicRoughness.empty() ||
-			 linker.Link(material["pbrMetallicRoughness"]["metallicRoughnessTexture"], link.MetallicRoughness,
-						 error)) &&
-			(link.Normal.empty() || linker.Link(material["normalTexture"], link.Normal, error)) &&
-			(link.Occlusion.empty() || linker.Link(material["occlusionTexture"], link.Occlusion, error));
+		const bool ok = (link.BaseColor.empty() ||
+						 linker.Link(material["pbrMetallicRoughness"]["baseColorTexture"], link.BaseColor, error)) &&
+						(link.MetallicRoughness.empty() ||
+						 linker.Link(material["pbrMetallicRoughness"]["metallicRoughnessTexture"],
+									 link.MetallicRoughness, error)) &&
+						(link.Normal.empty() || linker.Link(material["normalTexture"], link.Normal, error)) &&
+						(link.Occlusion.empty() || linker.Link(material["occlusionTexture"], link.Occlusion, error));
 
 		if (!ok) {
 			return false;
@@ -503,17 +723,24 @@ bool ExportGltfWithBakedMaterials(const std::string& source_path, const std::str
 	}
 
 	// The textures have no fallback image, so readers must support KTX2 to show them.
-	AddExtensionName(root, "extensionsUsed", spcBasisuExtension);
-	AddExtensionName(root, "extensionsRequired", spcBasisuExtension);
+	if (options.bUseBasisUExtension) {
+		AddExtensionName(root, "extensionsUsed", spcBasisuExtension);
+		AddExtensionName(root, "extensionsRequired", spcBasisuExtension);
+	}
+
+	RemoveUnused(root, bin, log);
+
+	// buffers[0] holds the binary chunk, which embedding and repacking may have resized.
+	if (!bin.empty()) {
+		if (JsonValue* buffers = root.Find("buffers"); buffers && buffers->IsArray() && !buffers->Array.empty()) {
+			buffers->Array[0]["byteLength"] = JsonValue::MakeNumber((long long)bin.size());
+		}
+	}
 
 	std::error_code ec;
 	fs::create_directories(output_dir, ec);
 
 	if (output_glb) {
-		if (embed_in_bin) {
-			root["buffers"].Array[0]["byteLength"] = JsonValue::MakeNumber((long long)bin.size());
-		}
-
 		if (!WriteFile(output_path, MakeGlb(WriteJson(root, false), bin), error)) {
 			return false;
 		}

@@ -7,13 +7,13 @@
 #include <wx/dcbuffer.h>
 #include <wx/filename.h>
 #include <wx/image.h>
-#include <wx/notebook.h>
 #include <wx/spinctrl.h>
 #include <wx/statline.h>
 #include <wx/stdpaths.h>
 #include <wx/wx.h>
 
 #include <algorithm>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -55,6 +55,10 @@ public:
 			mbEmbedTextures = ini[spcSectionOutput][spcKeyEmbedTextures] == "1";
 		}
 
+		if (ini.has(spcSectionOutput) && ini[spcSectionOutput].has(spcKeyUseBasisu)) {
+			mbUseBasisu = ini[spcSectionOutput][spcKeyUseBasisu] == "1";
+		}
+
 		if (ini.has(spcSectionOutput) && ini[spcSectionOutput].has(spcKeyCompression)) {
 			try {
 				const int value = std::stoi(ini[spcSectionOutput][spcKeyCompression]);
@@ -89,6 +93,7 @@ public:
 		ini[spcSectionOutput][spcKeyCompression] = std::to_string(int(mCompression));
 		ini[spcSectionOutput][spcKeyCreateSubfolder] = mbCreateSubfolder ? "1" : "0";
 		ini[spcSectionOutput][spcKeyEmbedTextures] = mbEmbedTextures ? "1" : "0";
+		ini[spcSectionOutput][spcKeyUseBasisu] = mbUseBasisu ? "1" : "0";
 
 		return file.write(ini, true);
 	}
@@ -108,6 +113,9 @@ public:
 	bool GetEmbedTextures() const { return mbEmbedTextures; }
 	void SetEmbedTextures(bool embed) { mbEmbedTextures = embed; }
 
+	bool GetUseBasisu() const { return mbUseBasisu; }
+	void SetUseBasisu(bool use) { mbUseBasisu = use; }
+
 private:
 	static std::string GetFilePath()
 	{
@@ -121,12 +129,14 @@ private:
 	static constexpr const char* spcKeyCompression = "Compression";
 	static constexpr const char* spcKeyCreateSubfolder = "CreateSubfolder";
 	static constexpr const char* spcKeyEmbedTextures = "EmbedTextures";
+	static constexpr const char* spcKeyUseBasisu = "UseBasisuExtension";
 
 	std::string mDefaultOutputDir;
 	int mResolutionDivisor = 1;
 	eTextureCompression mCompression = eTextureCompression::None;
 	bool mbCreateSubfolder = false;
 	bool mbEmbedTextures = false;
+	bool mbUseBasisu = true;
 };
 
 enum class eImageRole
@@ -169,7 +179,7 @@ public:
 		wxString SizeText;
 		wxString Source; // file or folder the entry came from
 		eImageRole Role = eImageRole::Unused;
-		ImageSource Image; // Image nodes only
+		ImageSource Image;			// Image nodes only
 		int GltfMaterialIndex = -1; // Material nodes of a model only: index into the glTF's materials
 	};
 
@@ -481,6 +491,120 @@ private:
 	bool mbDirty = true;
 };
 
+/**
+ * @brief A window listing the textures written by the last bake and showing each of their mip levels.
+ * Closing it only hides it, so it keeps its contents and can be reopened.
+ */
+class MipViewerFrame : public wxFrame
+{
+public:
+	explicit MipViewerFrame(wxWindow* parent)
+		: wxFrame(parent, wxID_ANY, "Mip Viewer", wxDefaultPosition, wxSize(800, 600))
+	{
+		auto* panel = new wxPanel(this);
+		auto* sizer = new wxBoxSizer(wxHORIZONTAL);
+		auto* left = new wxBoxSizer(wxVERTICAL);
+
+		mpTexChoice = new wxChoice(panel, wxID_ANY);
+		mpLevelList = new wxListBox(panel, wxID_ANY, wxDefaultPosition, wxSize(200, -1));
+		mpLevelInfo = new wxStaticText(panel, wxID_ANY, "Bake to view the mip levels.");
+
+		left->Add(mpTexChoice, 0, wxEXPAND | wxBOTTOM, 6);
+		left->Add(mpLevelList, 1, wxEXPAND | wxBOTTOM, 6);
+		left->Add(mpLevelInfo, 0, wxEXPAND);
+
+		mpCanvas = new ImageCanvas(panel);
+		sizer->Add(left, 0, wxEXPAND | wxALL, 6);
+		sizer->Add(mpCanvas, 1, wxEXPAND | wxALL, 6);
+		panel->SetSizer(sizer);
+
+		mpTexChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { ShowTexture(mpTexChoice->GetSelection()); });
+		mpLevelList->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) { ShowLevel(mpLevelList->GetSelection()); });
+
+		Bind(wxEVT_CLOSE_WINDOW,
+			 [this](wxCloseEvent& event)
+			 {
+				 if (event.CanVeto()) {
+					 event.Veto();
+					 Hide();
+				 }
+				 else {
+					 event.Skip();
+				 }
+			 });
+	}
+
+	/// Reads the baked files back so the viewer shows exactly what is on disk. Files that cannot be shown are
+	/// reported through `log`.
+	void LoadTextures(const std::vector<std::string>& files, const std::function<void(const wxString&)>& log)
+	{
+		mTextures.clear();
+		mpTexChoice->Clear();
+
+		for (const std::string& path : files) {
+			std::vector<MPImage> levels;
+			std::string e = ReadKTX2Levels(path, levels);
+
+			if (!e.empty()) {
+				log("Viewer: " + wxString::FromUTF8(e));
+				continue;
+			}
+
+			mTextures.push_back(std::move(levels));
+			mpTexChoice->Append(wxFileName(wxString::FromUTF8(path)).GetFullName());
+		}
+
+		if (mTextures.empty()) {
+			mpLevelList->Clear();
+			mpCanvas->SetImage(nullptr);
+			mpLevelInfo->SetLabel("No textures to show.");
+			return;
+		}
+
+		mpTexChoice->SetSelection(0);
+		ShowTexture(0);
+	}
+
+private:
+	void ShowTexture(int index)
+	{
+		mpLevelList->Clear();
+
+		if (index < 0 || index >= int(mTextures.size())) {
+			return;
+		}
+
+		const auto& levels = mTextures[index];
+
+		for (size_t i = 0; i < levels.size(); i++) {
+			mpLevelList->Append(wxString::Format("Level %zu  -  %d x %d", i, levels[i].Width, levels[i].Height));
+		}
+
+		mpLevelList->SetSelection(0);
+		ShowLevel(0);
+	}
+
+	void ShowLevel(int level)
+	{
+		const int tex = mpTexChoice->GetSelection();
+
+		if (tex < 0 || level < 0 || level >= int(mTextures[tex].size())) {
+			return;
+		}
+
+		const MPImage& img = mTextures[tex][level];
+		mpCanvas->SetImage(&img);
+		mpLevelInfo->SetLabel(wxString::Format("%d x %d  (%zu bytes)", img.Width, img.Height, img.Pixels.size()));
+	}
+
+	wxChoice* mpTexChoice;
+	wxListBox* mpLevelList;
+	wxStaticText* mpLevelInfo;
+	ImageCanvas* mpCanvas;
+
+	std::vector<std::vector<MPImage>> mTextures;
+};
+
 class MainFrame : public wxFrame
 {
 public:
@@ -558,15 +682,10 @@ public:
 		defs->Add(dgrid, 0, wxALL, 6);
 
 		auto* material_box = new wxStaticBoxSizer(wxVERTICAL, panel, "Material to export");
-		mpMaterialList = new wxListBox(material_box->GetStaticBox(), wxID_ANY, wxDefaultPosition, wxSize(-1, 60), 0,
+		mpMaterialList = new wxListBox(material_box->GetStaticBox(), wxID_ANY, wxDefaultPosition, wxSize(220, -1), 0,
 									   nullptr, wxLB_SINGLE);
 		material_box->Add(mpMaterialList, 1, wxEXPAND | wxALL, 6);
 		mpMaterialList->Bind(wxEVT_LISTBOX, &MainFrame::OnMaterialSelected, this);
-
-		auto* defs_row = new wxBoxSizer(wxHORIZONTAL);
-		defs_row->Add(defs, 0, wxEXPAND | wxRIGHT, 8);
-		defs_row->Add(material_box, 1, wxEXPAND);
-		root->Add(defs_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
 		auto* out = new wxStaticBoxSizer(wxVERTICAL, panel, "Output");
 		auto* ogrid = new wxFlexGridSizer(2, 6, 8);
@@ -695,46 +814,64 @@ public:
 							  });
 
 		out->Add(mpEmbedTextures, 0, wxLEFT | wxBOTTOM, 8);
-		root->Add(out, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
-		auto* bake_all_button = new wxButton(panel, wxID_ANY, "Bake All");
-		root->Add(bake_all_button, 1, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+		mpUseBasisu = new wxCheckBox(out->GetStaticBox(), wxID_ANY, "Use KHR_texture_basisu in glTF Export");
+		mpUseBasisu->SetToolTip("Link the .ktx2 textures through the KHR_texture_basisu extension, as the glTF spec "
+								"requires. Turn off for tools that do not support the extension, such as Blender.");
+
+		mpUseBasisu->SetValue(mConfig.GetUseBasisu());
+		mpUseBasisu->Bind(wxEVT_CHECKBOX,
+						  [this](wxCommandEvent&)
+						  {
+							  mConfig.SetUseBasisu(mpUseBasisu->GetValue());
+
+							  if (!mConfig.Save()) {
+								  mpLog->AppendText("Error: could not save the KHR_texture_basisu setting.\n");
+							  }
+						  });
+
+		out->Add(mpUseBasisu, 0, wxLEFT | wxBOTTOM, 8);
+
+		// Two panes: the materials to pick from on the left, the settings they are exported with on the right.
+		auto* settings = new wxBoxSizer(wxVERTICAL);
+		settings->Add(defs, 0, wxEXPAND | wxBOTTOM, 8);
+		settings->Add(out, 0, wxEXPAND);
+
+		auto* panes = new wxBoxSizer(wxHORIZONTAL);
+		panes->Add(material_box, 2, wxEXPAND | wxRIGHT, 8);
+		panes->Add(settings, 3, wxEXPAND);
+		root->Add(panes, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
 		auto* bake = new wxButton(panel, wxID_ANY, "Single Bake");
-		root->Add(bake, 1, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 8);
-
+		auto* bake_all_button = new wxButton(panel, wxID_ANY, "Bake All");
 		auto* export_gltf_button = new wxButton(panel, wxID_ANY, "Bake && Export glTF...");
 		export_gltf_button->SetToolTip("Bakes every material of the selected material's model, then saves a copy of "
 									   "the model with its materials linked to the baked textures.");
-		root->Add(export_gltf_button, 1, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+		auto* viewer_button = new wxButton(panel, wxID_ANY, "Mip Viewer");
+		viewer_button->SetToolTip("Show the mip levels of the textures from the last bake.");
+		viewer_button->Bind(wxEVT_BUTTON,
+							[this](wxCommandEvent&)
+							{
+								mpViewer->Show();
+								mpViewer->Raise();
+							});
+
+		auto* bake_row = new wxBoxSizer(wxHORIZONTAL);
+		bake_row->Add(viewer_button, 0, wxRIGHT, 18);
+		bake_row->Add(bake, 0, wxRIGHT, 6);
+		bake_row->Add(bake_all_button, 0, wxRIGHT, 6);
+		bake_row->Add(export_gltf_button, 0);
+		root->Add(bake_row, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
 
-		mpTabs = new wxNotebook(panel, wxID_ANY);
-		mpLog = new wxTextCtrl(mpTabs, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_MULTILINE | wxTE_READONLY);
-		mpTabs->AddPage(mpLog, "Log");
+		auto* log_box = new wxStaticBoxSizer(wxVERTICAL, panel, "Log");
+		mpLog = new wxTextCtrl(log_box->GetStaticBox(), wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+							   wxTE_MULTILINE | wxTE_READONLY);
+		log_box->Add(mpLog, 1, wxEXPAND | wxALL, 6);
+		root->Add(log_box, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
-		auto* viewer = new wxPanel(mpTabs);
-		auto* vsizer = new wxBoxSizer(wxHORIZONTAL);
-		auto* left = new wxBoxSizer(wxVERTICAL);
-
-		mpTexChoice = new wxChoice(viewer, wxID_ANY);
-		mpLevelList = new wxListBox(viewer, wxID_ANY, wxDefaultPosition, wxSize(200, -1));
-		mpLevelInfo = new wxStaticText(viewer, wxID_ANY, "Bake to view the mip levels.");
-
-		left->Add(mpTexChoice, 0, wxEXPAND | wxBOTTOM, 6);
-		left->Add(mpLevelList, 1, wxEXPAND | wxBOTTOM, 6);
-		left->Add(mpLevelInfo, 0, wxEXPAND);
-
-		mpCanvas = new ImageCanvas(viewer);
-		vsizer->Add(left, 0, wxEXPAND | wxALL, 6);
-		vsizer->Add(mpCanvas, 1, wxEXPAND | wxALL, 6);
-		viewer->SetSizer(vsizer);
-		mpTabs->AddPage(viewer, "Mip Viewer", true);
-
-		root->Add(mpTabs, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
-
-		mpTexChoice->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { ShowTexture(mpTexChoice->GetSelection()); });
-		mpLevelList->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) { ShowLevel(mpLevelList->GetSelection()); });
+		mpViewer = new MipViewerFrame(this);
 
 		panel->SetSizer(root);
 
@@ -1137,7 +1274,6 @@ private:
 
 		if (material == nullptr) {
 			mpLog->AppendText("Error: select a material to export.\n");
-			mpTabs->SetSelection(0);
 			return false;
 		}
 
@@ -1187,12 +1323,7 @@ private:
 
 		mpLog->AppendText(ok ? "Done.\n" : "Finished with errors.\n");
 
-		const std::vector<std::string> written = baked.All();
-		LoadViewer(written);
-
-		if (ok && !written.empty()) {
-			mpTabs->SetSelection(1);
-		}
+		mpViewer->LoadTextures(baked.All(), [this](const wxString& line) { mpLog->AppendText(line + "\n"); });
 
 		if (outputs) {
 			*outputs = baked;
@@ -1238,7 +1369,6 @@ private:
 
 		if (!model || model->Kind != ImageTreeModel::eKind::Model) {
 			mpLog->AppendText("Error: select a material from a glTF model to export.\n");
-			mpTabs->SetSelection(0);
 			return;
 		}
 
@@ -1291,9 +1421,13 @@ private:
 
 		mpLog->AppendText("\n");
 
+		GltfExportOptions options;
+		options.bEmbedTextures = mpEmbedTextures->GetValue();
+		options.bUseBasisUExtension = mpUseBasisu->GetValue();
+
 		std::string error;
 		const bool exported = ExportGltfWithBakedMaterials(
-			model->Source.utf8_string(), output.GetFullPath().utf8_string(), links, mpEmbedTextures->GetValue(),
+			model->Source.utf8_string(), output.GetFullPath().utf8_string(), links, options,
 			[this](const std::string& line) { mpLog->AppendText(wxString::FromUTF8(line) + "\n"); }, error);
 
 		if (!exported) {
@@ -1301,68 +1435,6 @@ private:
 		}
 
 		mpLog->AppendText(exported && all_ok ? "Export done.\n" : "Export finished with errors.\n");
-		mpTabs->SetSelection(0);
-	}
-
-	// Reads the baked files back so the viewer shows exactly what is on disk.
-	void LoadViewer(const std::vector<std::string>& files)
-	{
-		mTextures.clear();
-		mpTexChoice->Clear();
-
-		for (const std::string& path : files) {
-			std::vector<MPImage> levels;
-			std::string e = ReadKTX2Levels(path, levels);
-
-			if (!e.empty()) {
-				mpLog->AppendText("Viewer: " + wxString::FromUTF8(e) + "\n");
-				continue;
-			}
-
-			mTextures.push_back(std::move(levels));
-			mpTexChoice->Append(wxFileName(wxString::FromUTF8(path)).GetFullName());
-		}
-
-		if (mTextures.empty()) {
-			mpLevelList->Clear();
-			mpCanvas->SetImage(nullptr);
-			mpLevelInfo->SetLabel("No textures to show.");
-			return;
-		}
-
-		mpTexChoice->SetSelection(0);
-		ShowTexture(0);
-	}
-
-	void ShowTexture(int index)
-	{
-		mpLevelList->Clear();
-
-		if (index < 0 || index >= int(mTextures.size())) {
-			return;
-		}
-
-		const auto& levels = mTextures[index];
-
-		for (size_t i = 0; i < levels.size(); i++) {
-			mpLevelList->Append(wxString::Format("Level %zu  -  %d x %d", i, levels[i].Width, levels[i].Height));
-		}
-
-		mpLevelList->SetSelection(0);
-		ShowLevel(0);
-	}
-
-	void ShowLevel(int level)
-	{
-		const int tex = mpTexChoice->GetSelection();
-
-		if (tex < 0 || level < 0 || level >= int(mTextures[tex].size())) {
-			return;
-		}
-
-		const MPImage& img = mTextures[tex][level];
-		mpCanvas->SetImage(&img);
-		mpLevelInfo->SetLabel(wxString::Format("%d x %d  (%zu bytes)", img.Width, img.Height, img.Pixels.size()));
 	}
 
 private:
@@ -1376,15 +1448,10 @@ private:
 	wxCheckBox* mpMips;
 	wxCheckBox* mpSubfolder;
 	wxCheckBox* mpEmbedTextures;
+	wxCheckBox* mpUseBasisu;
 	wxChoice* mpDivisor;
 	wxChoice* mpCompression;
-	wxNotebook* mpTabs;
-	wxChoice* mpTexChoice;
-	wxListBox* mpLevelList;
-	wxStaticText* mpLevelInfo;
-	ImageCanvas* mpCanvas;
-
-	std::vector<std::vector<MPImage>> mTextures;
+	MipViewerFrame* mpViewer; // owned by this frame
 	ConfigSettings mConfig;
 };
 
